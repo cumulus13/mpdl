@@ -1,0 +1,118 @@
+# mpdl Configuration File
+# Save this file as:
+#   Linux/macOS: ~/.config/mpdl/config.toml
+#   Windows: %APPDATA%\mpdl\config.toml
+
+# MPD Server Configuration
+[mpd]
+# MPD server host
+# Default: localhost
+# Environment: MPD_HOST
+host = "localhost"
+
+# MPD server port
+# Default: 6600
+# Environment: MPD_PORT
+port = "6600"
+
+# MPD password (if required)
+# Default: "" (no password)
+# Environment: MPD_PASSWORD
+password = ""
+
+# Connection timeout in seconds
+# Default: 10
+# Environment: MPD_TIMEOUT
+timeout = 10
+
+# Music root directory
+# This is the base directory where your music files are stored
+# Default:
+#   Windows: C:/Musics
+#   Linux: ~/Music
+#   macOS: ~/Music
+# Environment: MPD_MUSIC_ROOT
+music_root = "C:/Musics"  # Windows
+# music_root = "/home/user/Music"  # Linux
+# music_root = "/Users/user/Music"  # macOS
+
+# MPD configuration file path (for get-config/set-config commands)
+# Only works for local MPD instances
+# Default:
+#   Windows: C:/mpd/mpd.conf or %APPDATA%/mpd/mpd.conf
+#   Linux: ~/.config/mpd/mpd.conf
+#   macOS: ~/.config/mpd/mpd.conf
+config_path = "C:/mpd/mpd.conf"  # Windows
+# config_path = "/home/user/.config/mpd/mpd.conf"  # Linux
+# config_path = "/Users/user/.config/mpd/mpd.conf"  # macOS
+
+# GNTP/Growl Notification Configuration
+[gntp]
+# GNTP server host
+# Default: localhost
+host = "localhost"
+
+# GNTP server port
+# Default: 23053 (standard GNTP port)
+port = 23053
+
+# GNTP password (if your Growl requires it)
+# Default: "" (no password)
+password = ""
+
+# Icon mode for album artwork
+# Options:
+#   binary   - Send icon as binary data (recommended for Windows)
+#   dataurl  - Send icon as data URL
+#   fileurl  - Send icon as file URL
+#   httpurl  - Send icon as HTTP URL
+# Default: binary
+icon_mode = "binary"
+
+# Enable GNTP notifications
+# Set to false to disable notifications completely
+# Default: true
+enabled = true
+
+# Display Configuration
+[display]
+# Show album art in notifications (when available)
+# Default: true
+show_album_art = true
+
+# Use colored terminal output
+# Set to false for monochrome output
+# Default: true
+use_color = true
+
+# Examples for different setups:
+
+# Example 1: Remote MPD server
+# [mpd]
+# host = "192.168.1.100"
+# port = "6600"
+# password = "my_secret_password"
+# music_root = "/mnt/music"
+
+# Example 2: Local MPD with custom paths
+# [mpd]
+# host = "localhost"
+# port = "6600"
+# music_root = "/data/music"
+# config_path = "/etc/mpd.conf"
+
+# Example 3: Minimal configuration (use defaults)
+# [mpd]
+# host = "localhost"
+# port = "6600"
+
+# Example 4: Disable notifications
+# [gntp]
+# enabled = false
+
+# Example 5: Remote Growl server
+# [gntp]
+# host = "192.168.1.50"
+# port = 23053
+# password = "growl_password"
+# icon_mode = "httpurl"

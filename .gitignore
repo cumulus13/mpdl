@@ -1,0 +1,69 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Dependency directories
+vendor/
+
+# Built binaries
+mpdl
+mpdl-*
+/dist/
+/build/
+
+# Configuration files (keep example)
+config.toml
+*.local.toml
+
+# IDE specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Debug files
+debug
+debug.test
+*.log
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Release archives
+*.tar.gz
+*.zip
+checksums.txt
+
+# Local development
+local/
+# PT backup directory
+.pt/
+
+# Added entries (1 items)
+*sublime*
+
+# Added entries (1 items)
+INTEGRATION_GUIDE.md
+
+# Added entries (1 items)
+PROJECT_SUMMARY.md
+
+# Added entries (1 items)
+build.yml

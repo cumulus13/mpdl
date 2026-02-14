@@ -1,0 +1,18 @@
+mpd:
+  host: localhost
+  port: "6600"
+  password: ""
+  timeout: 10
+  music_root: "C:/Musics"
+  config_path: "C:/mpd/mpd.conf"
+
+gntp:
+  host: localhost
+  port: 23053
+  password: ""
+  icon_mode: binary
+  enabled: true
+
+display:
+  show_album_art: true
+  use_color: true
