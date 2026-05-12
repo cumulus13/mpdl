@@ -22,8 +22,8 @@ import (
 	"github.com/cumulus13/go-gntp"
 	"github.com/fhs/gompd/v2/mpd"
 	"golang.org/x/term"
+	// "google.golang.org/appengine/file"
 	// "gopkg.in/yaml.v3"
-
 )
 
 var (
@@ -1515,6 +1515,13 @@ func main() {
 		
 		// FIXED: Join all args to handle paths with spaces
 		path := strings.Join(commandArgs, " ")
+		
+		path, err := filepath.Abs(path)
+		fmt.Printf("\033[37;41mPath to add: '%s'%s\n", path, Reset)
+		if err != nil {
+			panic(err)
+		}
+
 		// Remove quotes if present
 		path = strings.Trim(path, "\"'")
 		
