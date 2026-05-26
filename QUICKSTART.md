@@ -37,6 +37,8 @@ sudo make install
 
 ### First Time Setup
 
+#### Local MPD
+
 1. **Make sure MPD is running:**
    ```bash
    # Linux
