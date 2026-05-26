@@ -32,25 +32,21 @@ type MediaKeyMonitor struct {
 	lastCmd    time.Time
 }
 
-// NewMediaKeyMonitor creates a new media key monitor
 func NewMediaKeyMonitor(client *MPDClient, debug bool) *MediaKeyMonitor {
 	return &MediaKeyMonitor{
 		client:     client,
 		debug:      debug,
 		stopChan:   make(chan struct{}),
-		debounceMs: 200, // 200ms debounce to prevent double-press
+		debounceMs: 300,
 	}
 }
 
-// Start begins monitoring media keys
 func (m *MediaKeyMonitor) Start() error {
 	if m.isRunning {
-		return fmt.Errorf("media key monitor already running")
+		return fmt.Errorf("already running")
 	}
-
 	m.isRunning = true
 
-	// Handle platform-specific media key monitoring
 	switch runtime.GOOS {
 	case "windows":
 		go m.monitorWindows()
@@ -66,19 +62,13 @@ func (m *MediaKeyMonitor) Start() error {
 	if m.debug {
 		log.Printf("🎹 Media key monitoring started (%s)", runtime.GOOS)
 	}
-
 	return nil
 }
 
-// Stop stops monitoring media keys
 func (m *MediaKeyMonitor) Stop() {
 	if m.isRunning {
 		close(m.stopChan)
 		m.isRunning = false
-
-		if m.debug {
-			log.Println("🎹 Media key monitoring stopped")
-		}
 	}
 }
 
@@ -99,11 +89,6 @@ func (m *MediaKeyMonitor) actionPlayPause() {
 	if !m.debounce() {
 		return
 	}
-
-	if m.debug {
-		log.Println("⏯️  Media key: Play/Pause")
-	}
-
 	status, err := m.client.Status()
 	if err != nil {
 		if m.debug {
@@ -111,26 +96,16 @@ func (m *MediaKeyMonitor) actionPlayPause() {
 		}
 		return
 	}
-
-	state := status["state"]
-	if state == "play" {
-		// Currently playing, pause it
-		if err := m.client.Pause(); err != nil {
-			if m.debug {
-				log.Printf("⚠️  Failed to pause: %v", err)
-			}
-		} else {
+	if status["state"] == "play" {
+		_ = m.client.Pause()
+		if m.debug {
 			log.Println("⏸ Media key → Pause")
-        }
+		}
 	} else {
-		// Currently paused or stopped, play
-		if err := m.client.Play(-1); err != nil {
-			if m.debug {
-				log.Printf("⚠️  Failed to play: %v", err)
-			}
-		} else {
+		_ = m.client.Play(-1)
+		if m.debug {
 			log.Println("▶ Media key → Play")
-        }
+		}
 	}
 }
 
@@ -140,13 +115,7 @@ func (m *MediaKeyMonitor) actionNext() {
 	}
 	_ = m.client.Next()
 	if m.debug {
-		log.Println("⏭️  Media key: Next")
-	}
-
-	if err := m.client.Next(); err != nil {
-		if m.debug {
-			log.Printf("⚠️  Failed to skip: %v", err)
-		}
+		log.Println("⏭ Media key → Next")
 	}
 }
 
@@ -156,13 +125,7 @@ func (m *MediaKeyMonitor) actionPrev() {
 	}
 	_ = m.client.Previous()
 	if m.debug {
-		log.Println("⏮️  Media key: Previous")
-	}
-
-	if err := m.client.Previous(); err != nil {
-		if m.debug {
-			log.Printf("⚠️  Failed to go back: %v", err)
-		}
+		log.Println("⏮ Media key → Previous")
 	}
 }
 
@@ -172,13 +135,7 @@ func (m *MediaKeyMonitor) actionStop() {
 	}
 	_ = m.client.Stop()
 	if m.debug {
-		log.Println("⏹️  Media key: Stop")
-	}
-
-	if err := m.client.Stop(); err != nil {
-		if m.debug {
-			log.Printf("⚠️  Failed to stop: %v", err)
-		}
+		log.Println("⏹ Media key → Stop")
 	}
 }
 

@@ -13,11 +13,14 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/cumulus13/go-gntp"
@@ -887,43 +890,15 @@ func (m *MPDClient) SeekThrough(seconds float64) error {
 
 // ── Tag listing ──────────────────────────────────────────────────────────────
 
-// ListTags lists all values for a tag type, optionally filtered and grouped.
-// func (m *MPDClient) ListTags(tagType string, filter []string, groupBy []string) ([]mpd.Attrs, error) {
-// 	if err := m.ensureConnected(); err != nil {
-// 		return nil, err
-// 	}
-// 	args := []string{tagType}
-// 	args = append(args, filter...)
-// 	for _, g := range groupBy {
-// 		args = append(args, "group", g)
-// 	}
-// 	return m.client.List(tagType, filter...)
-// }
-
-// Fix ListTags method (line 890-901)
-// Replace the entire method with:
-func (m *MPDClient) ListTags(tagType string, filter []string, groupBy []string) ([]mpd.Attrs, error) {
+// ListTags lists all values for a tag type, optionally filtered.
+// Returns a flat list of string values (gompd List returns []string).
+func (m *MPDClient) ListTags(tagType string, filter ...string) ([]string, error) {
 	if err := m.ensureConnected(); err != nil {
 		return nil, err
 	}
-	// gompd v2 List returns []string, we need to convert to []mpd.Attrs
-	args := []string{tagType}
-	args = append(args, filter...)
-	for _, g := range groupBy {
-		args = append(args, "group", g)
-	}
-	
-	values, err := m.client.List(args...)
-	if err != nil {
-		return nil, err
-	}
-	
-	// Convert []string to []mpd.Attrs
-	var result []mpd.Attrs
-	for _, v := range values {
-		result = append(result, mpd.Attrs{tagType: v})
-	}
-	return result, nil
+	// gompd List takes all args as a flat variadic: tagType, [filterType, filterValue, ...]
+	args := append([]string{tagType}, filter...)
+	return m.client.List(args...)
 }
 
 // ── Directory listing ────────────────────────────────────────────────────────
@@ -1037,6 +1012,7 @@ func (m *MPDClient) StickerList(uri string) ([]mpd.Attrs, error) {
 	if err := m.ensureConnected(); err != nil {
 		return nil, err
 	}
+	// startKey for sticker list response is "sticker"
 	return m.client.Command("sticker list song %s", uri).AttrsList("sticker")
 }
 
@@ -1044,11 +1020,13 @@ func (m *MPDClient) StickerFind(dir, key string) ([]mpd.Attrs, error) {
 	if err := m.ensureConnected(); err != nil {
 		return nil, err
 	}
-	return m.client.Command("sticker find song %s %s", dir, key).AttrsList("sticker")
+	return m.client.Command("sticker find song %s %s", dir, key).AttrsList("file")
 }
 
 // ── Output toggle ────────────────────────────────────────────────────────────
 
+// ToggleOutput toggles an audio output on/off by ID.
+// gompd v2 does not expose ToggleOutput as a typed method; use Command.
 func (m *MPDClient) ToggleOutput(id int) error {
 	if err := m.ensureConnected(); err != nil {
 		return err
@@ -1797,123 +1775,432 @@ func sendNotification(state *AppState, event, title, message string, icon *gntp.
 // Monitor loop
 // ──────────────────────────────────────────────
 
-func checkStatus(state *AppState) error {
-	if err := state.client.client.Ping(); err != nil {
-		return fmt.Errorf("connection lost: %v", err)
+// ──────────────────────────────────────────────
+// Monitor — live progress bar + keyboard input
+// ──────────────────────────────────────────────
+
+// monitorUI is the self-contained monitor display + keyboard handler.
+// It runs in the foreground and owns the terminal.
+//
+// Design:
+//   • A 1-second ticker redraws the progress bar in-place (ANSI cursor up).
+//   • An MPD Watcher fires on song/mixer events (song change, state change).
+//   • A goroutine reads raw stdin bytes for keyboard control.
+//   • q / ESC / Ctrl-C all quit cleanly — NOT global, only active while
+//     the monitor command is in the foreground.
+func runMonitor(state *AppState) error {
+	// ── startup banner ───────────────────────────────────────────────────────
+	w := getTerminalWidth()
+	fmt.Println(strings.Repeat("═", w))
+	fmt.Printf("%s🎵 mpdl monitor%s  %s%s%s:%s%s\n",
+		Bold+ColorCyan, Reset,
+		ColorGray, state.config.MPD.Host, Reset,
+		ColorGray, state.config.MPD.Port+Reset)
+
+	if state.gntpEnabled {
+		fmt.Printf("  📢 GNTP %s%s:%d%s  icon-mode:%s\n",
+			ColorGray, state.config.GNTP.Host, state.config.GNTP.Port, Reset,
+			state.config.GNTP.IconMode)
+	} else {
+		fmt.Printf("  📢 Notifications: %sdisabled%s\n", ColorGray, Reset)
 	}
-	status, err := state.client.Status()
+
+	// ── media key status ─────────────────────────────────────────────────────
+	mediaKeyStatus := detectMediaKeySupport(state.debug)
+	fmt.Printf("  🎹 Media keys: %s\n", mediaKeyStatus)
+
+	fmt.Printf("  ⌨️  Keys: %s[p]%s play/pause  %s[n]%s next  %s[b]%s prev  %s[s]%s stop  %s[q/Esc]%s quit\n",
+		Bold, Reset, Bold, Reset, Bold, Reset, Bold, Reset, Bold, Reset)
+	fmt.Println(strings.Repeat("─", w))
+
+	// ── raw terminal mode (local to this process, not global) ────────────────
+	fd := int(os.Stdin.Fd())
+	oldState, err := term.MakeRaw(fd)
 	if err != nil {
-		return fmt.Errorf("get status: %v", err)
+		// Can't get raw mode (e.g. piped stdin). Warn but continue without keys.
+		fmt.Printf("  ⚠️  Keyboard unavailable (%v) — use Ctrl-C to quit\n", err)
+		oldState = nil
 	}
-	song, err := state.client.CurrentSong()
-	if err != nil {
-		return fmt.Errorf("get current song: %v", err)
-	}
-
-	currentState := status["state"]
-	currentFile := song["file"]
-	songChanged := currentFile != state.lastSongFile && currentFile != ""
-	stateChanged := currentState != state.lastState && state.lastState != ""
-
-	if currentState == "play" && currentFile != "" {
-		fmt.Println()
-		fmt.Println(formatConsoleMessage(song, status, state.showProgress))
-		printSeparator()
-	} else if stateChanged {
-		fmt.Printf("⏸  State: %s\n", currentState)
-		printSeparator()
-	}
-
-	if songChanged && currentState == "play" {
-		art := getAlbumArt(state.client.client, currentFile)
-		title := getOrDefault(song, "Title", currentFile)
-		if err := sendNotification(state, "song_change", title, formatNotificationMessage(song, status), art); err != nil {
-			if state.debug {
-				log.Printf("⚠️  Notification: %v", err)
-			}
+	restoreTerminal := func() {
+		if oldState != nil {
+			_ = term.Restore(fd, oldState)
 		}
-		state.lastSongFile = currentFile
 	}
+	defer restoreTerminal()
 
-	if stateChanged {
-		stateMsg := map[string]string{
-			"play":  "▶ Playing",
-			"pause": "⏸ Paused",
-			"stop":  "⏹ Stopped",
-		}[currentState]
-		if stateMsg == "" {
-			stateMsg = currentState
-		}
-		var art *gntp.Resource
-		if currentFile != "" {
-			art = getAlbumArt(state.client.client, currentFile)
-		}
-		msg := stateMsg
-		if currentState == "play" && currentFile != "" {
-			msg = formatNotificationMessage(song, status)
-		}
-		_ = sendNotification(state, "player_state", stateMsg, msg, art)
-	}
+	// ── channels ─────────────────────────────────────────────────────────────
+	quitCh := make(chan struct{})   // keyboard or signal requests quit
+	keyCh  := make(chan byte, 8)   // raw key bytes from stdin reader
+	errCh  := make(chan error, 1)  // fatal errors from watcher goroutine
 
-	state.lastState = currentState
-	return nil
-}
-
-func monitorOnce(state *AppState) error {
-	w, err := mpd.NewWatcher("tcp",
-		fmt.Sprintf("%s:%s", state.config.MPD.Host, state.config.MPD.Port),
-		state.config.MPD.Password, "player", "mixer")
-	if err != nil {
-		return fmt.Errorf("watcher: %v", err)
-	}
-	done := make(chan struct{})
-	defer close(done)
-
-	go func() {
-		defer func() { recover() }()
-		for {
-			select {
-			case err, ok := <-w.Error:
-				if !ok {
+	// ── keyboard goroutine ───────────────────────────────────────────────────
+	if oldState != nil {
+		go func() {
+			buf := make([]byte, 4)
+			for {
+				n, err := os.Stdin.Read(buf)
+				if err != nil || n == 0 {
 					return
 				}
-				if state.debug {
-					log.Printf("⚠️  Watcher error: %v", err)
+				select {
+				case keyCh <- buf[0]:
+				case <-quitCh:
+					return
 				}
-			case <-done:
+			}
+		}()
+	}
+
+	// ── signal handler ───────────────────────────────────────────────────────
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		close(quitCh)
+	}()
+
+	// ── MPD watcher goroutine ─────────────────────────────────────────────────
+	eventCh := make(chan string, 8)
+	go func() {
+		for {
+			select {
+			case <-quitCh:
+				return
+			default:
+			}
+
+			watcher, err := mpd.NewWatcher("tcp",
+				fmt.Sprintf("%s:%s", state.config.MPD.Host, state.config.MPD.Port),
+				state.config.MPD.Password,
+				"player", "mixer", "playlist")
+			if err != nil {
+				if state.debug {
+					log.Printf("⚠️  watcher: %v", err)
+				}
+				select {
+				case <-quitCh:
+					return
+				case <-time.After(3 * time.Second):
+					continue
+				}
+			}
+
+			watcherDone := make(chan struct{})
+			go func() {
+				defer close(watcherDone)
+				for {
+					select {
+					case sub, ok := <-watcher.Event:
+						if !ok {
+							return
+						}
+						select {
+						case eventCh <- sub:
+						default:
+						}
+					case <-watcher.Error:
+					case <-quitCh:
+						watcher.Close()
+						return
+					}
+				}
+			}()
+
+			select {
+			case <-watcherDone:
+				// reconnect
+				select {
+				case <-quitCh:
+					return
+				case <-time.After(2 * time.Second):
+					_ = state.client.reconnect()
+				}
+			case <-quitCh:
+				watcher.Close()
 				return
 			}
 		}
 	}()
 
-	for {
-		select {
-		case subsystem, ok := <-w.Event:
-			if !ok {
-				w.Close()
-				return fmt.Errorf("event channel closed")
+	// ── display state ─────────────────────────────────────────────────────────
+	// We draw a fixed-height block and use ANSI cursor-up to overwrite it.
+	// displayLines tracks how many lines were printed last time so we can
+	// erase exactly that many on the next redraw.
+	displayLines := 0
+
+	redraw := func() {
+		status, err := state.client.Status()
+		if err != nil {
+			return
+		}
+		song, err := state.client.CurrentSong()
+		if err != nil {
+			return
+		}
+
+		// Handle song-change notifications
+		currentFile := song["file"]
+		if currentFile != state.lastSongFile && currentFile != "" {
+			if state.gntpEnabled {
+				art := getAlbumArt(state.client.client, currentFile)
+				title := getOrDefault(song, "Title", currentFile)
+				_ = sendNotification(state, "song_change", title,
+					formatNotificationMessage(song, status), art)
 			}
-			if subsystem == "database" || subsystem == "update" {
-				continue
+			state.lastSongFile = currentFile
+		}
+		currentState := status["state"]
+		if currentState != state.lastState && state.lastState != "" {
+			stateMsg := map[string]string{
+				"play":  "▶ Playing",
+				"pause": "⏸ Paused",
+				"stop":  "⏹ Stopped",
+			}[currentState]
+			if stateMsg == "" {
+				stateMsg = currentState
 			}
-			if err := checkStatus(state); err != nil {
-				if state.debug {
-					log.Printf("⚠️  checkStatus: %v", err)
+			if state.gntpEnabled {
+				var art *gntp.Resource
+				if currentFile != "" {
+					art = getAlbumArt(state.client.client, currentFile)
 				}
-				if isConnectionErr(err) {
-					w.Close()
-					return err
-				}
-			}
-		case <-done:
-			w.Close()
-			return nil
-		case <-time.After(30 * time.Second):
-			if err := state.client.client.Ping(); err != nil {
-				w.Close()
-				return fmt.Errorf("ping: %v", err)
+				_ = sendNotification(state, "player_state", stateMsg,
+					formatNotificationMessage(song, status), art)
 			}
 		}
+		state.lastState = currentState
+
+		// ── erase previous block ──────────────────────────────────────────
+		if displayLines > 0 {
+			// Move cursor up N lines, then erase from cursor to end of screen.
+			fmt.Printf("\033[%dA\033[J", displayLines)
+		}
+
+		// ── build new block ───────────────────────────────────────────────
+		tw := getTerminalWidth()
+		var sb strings.Builder
+		lines := 0
+
+		addLine := func(s string) {
+			sb.WriteString(s + "\n")
+			lines++
+		}
+
+		stateStr := status["state"]
+		stateIcon := map[string]string{
+			"play":  ColorGreen + "▶" + Reset,
+			"pause": ColorYellow + "⏸" + Reset,
+			"stop":  ColorRed + "⏹" + Reset,
+		}[stateStr]
+		if stateIcon == "" {
+			stateIcon = stateStr
+		}
+
+		if stateStr == "stop" {
+			addLine(fmt.Sprintf("%s  Stopped%s", ColorRed, Reset))
+		} else {
+			title := getOrDefault(song, "Title", song["file"])
+			artist := getOrDefault(song, "Artist", "")
+			album := getOrDefault(song, "Album", "")
+			track := getOrDefault(song, "Track", "")
+			date := song["Date"]
+			qpos := status["song"]
+			qtotal := status["playlistlength"]
+
+			// title line
+			trackPfx := ""
+			if track != "" {
+				trackPfx = fmt.Sprintf("%s#%s.%s ", ColorGray, track, Reset)
+			}
+			addLine(fmt.Sprintf("  %s%s%s%s%s", trackPfx, Bold+ColorWhite, title, Reset, ""))
+
+			// artist / album
+			meta := ""
+			if artist != "" {
+				meta += fmt.Sprintf("%s%s%s", ColorYellow, artist, Reset)
+			}
+			if album != "" {
+				if meta != "" {
+					meta += fmt.Sprintf("  %s·%s  ", ColorGray, Reset)
+				}
+				meta += fmt.Sprintf("%s%s%s", ColorOrange, album, Reset)
+			}
+			if date != "" {
+				meta += fmt.Sprintf("  %s(%s)%s", ColorGray, date, Reset)
+			}
+			if meta != "" {
+				addLine("  " + meta)
+			}
+
+			// queue position
+			addLine(fmt.Sprintf("  %sQueue: %s/%s%s", ColorGray, qpos, qtotal, Reset))
+
+			// progress bar — updated every second
+			elapsedSec, _ := strconv.ParseFloat(status["elapsed"], 64)
+			durSec, _ := strconv.ParseFloat(song["duration"], 64)
+			elapsedFmt := formatDuration(status["elapsed"])
+			durFmt := formatDuration(song["duration"])
+
+			barWidth := tw - 24
+			if barWidth < 10 {
+				barWidth = 10
+			}
+			filled := 0
+			pct := 0.0
+			if durSec > 0 {
+				pct = elapsedSec / durSec
+				filled = int(pct * float64(barWidth))
+				if filled > barWidth {
+					filled = barWidth
+				}
+			}
+			bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
+			addLine(fmt.Sprintf("  %s%s%s [%s%s%s] %s%s / %s%s",
+				stateIcon, " ", Reset,
+				ColorCyan, bar, Reset,
+				ColorGray, elapsedFmt, durFmt, Reset))
+
+			// status flags
+			vol := status["volume"]
+			rep := boolState(status["repeat"])
+			rnd := boolState(status["random"])
+			sng := boolState(status["single"])
+			cns := boolState(status["consume"])
+			xf := status["xfade"]
+			br := formatBitrate(status)
+			addLine(fmt.Sprintf("  %svol:%s%-4s  rep:%s  rnd:%s  sng:%s  cns:%s  xfade:%ss  %s%s",
+				ColorGray, Reset, vol+"%",
+				rep, rnd, sng, cns, xf, br, Reset))
+
+			// file path
+			addLine(fmt.Sprintf("  %s%s%s", ColorGray, song["file"], Reset))
+		}
+
+		sb.WriteString(strings.Repeat("─", tw))
+		lines++
+
+		fmt.Print(sb.String())
+		displayLines = lines
+	}
+
+	// ── initial draw ──────────────────────────────────────────────────────────
+	redraw()
+
+	// ── main event loop ───────────────────────────────────────────────────────
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-quitCh:
+			restoreTerminal()
+			fmt.Println("\n👋  Monitor stopped.")
+			return nil
+
+		case err := <-errCh:
+			return err
+
+		case <-ticker.C:
+			// Live progress bar update every second
+			if err := state.client.ensureConnected(); err == nil {
+				redraw()
+			}
+
+		case sub := <-eventCh:
+			// MPD event — redraw immediately
+			if sub != "database" && sub != "update" {
+				_ = state.client.ensureConnected()
+				redraw()
+			}
+
+		case key := <-keyCh:
+			switch key {
+			case 'q', 'Q', 27 /* ESC */, 3 /* Ctrl-C */:
+				close(quitCh)
+
+			case 'p', 'P', ' ':
+				// play/pause toggle
+				s, err := state.client.Status()
+				if err != nil {
+					break
+				}
+				if s["state"] == "play" {
+					_ = state.client.Pause()
+				} else {
+					_ = state.client.Play(-1)
+				}
+
+			case 'n', 'N':
+				_ = state.client.Next()
+
+			case 'b', 'B':
+				_ = state.client.Previous()
+
+			case 's', 'S':
+				_ = state.client.Stop()
+
+			case '+', '=':
+				_ = state.client.VolumeRelative(+5)
+
+			case '-':
+				_ = state.client.VolumeRelative(-5)
+			}
+		}
+	}
+}
+
+// detectMediaKeySupport probes for media key infrastructure and returns a
+// human-readable status string shown in the monitor banner.
+func detectMediaKeySupport(debug bool) string {
+	switch runtime.GOOS {
+	case "linux":
+		// Check playerctl
+		if path, err := exec.LookPath("playerctl"); err == nil {
+			// Try to actually query it
+			out, err := exec.Command("playerctl", "--list-all").Output()
+			if err == nil {
+				players := strings.TrimSpace(string(out))
+				if strings.Contains(players, "mpd") {
+					return fmt.Sprintf("%s✓ playerctl (%s) — MPD detected, media keys active%s", ColorGreen, path, Reset)
+				}
+				return fmt.Sprintf("%s⚠ playerctl found (%s) but MPD not listed — run mpDris2 or mpd-mpris%s", ColorYellow, path, Reset)
+			}
+			return fmt.Sprintf("%s⚠ playerctl found but not responding%s", ColorYellow, Reset)
+		}
+		// Check for mpd-mpris / mpdris2 process
+		out, _ := exec.Command("pgrep", "-x", "mpDris2").Output()
+		if len(strings.TrimSpace(string(out))) > 0 {
+			return fmt.Sprintf("%s✓ mpDris2 running — media keys active%s", ColorGreen, Reset)
+		}
+		out, _ = exec.Command("pgrep", "-x", "mpd-mpris").Output()
+		if len(strings.TrimSpace(string(out))) > 0 {
+			return fmt.Sprintf("%s✓ mpd-mpris running — media keys active%s", ColorGreen, Reset)
+		}
+		return fmt.Sprintf("%s✗ not active — install mpd-mpris or playerctl, run: mpdl mediakeys%s", ColorRed, Reset)
+
+	case "windows":
+		// Check AutoHotkey
+		out, _ := exec.Command("tasklist", "/FI", "IMAGENAME eq AutoHotkey*.exe", "/NH").Output()
+		if strings.Contains(strings.ToLower(string(out)), "autohotkey") {
+			return fmt.Sprintf("%s✓ AutoHotkey running — check your script maps media keys to mpdl%s", ColorGreen, Reset)
+		}
+		return fmt.Sprintf("%s⚠ AutoHotkey not detected — media keys may not work, run: mpdl mediakeys%s", ColorYellow, Reset)
+
+	case "darwin":
+		// Check Hammerspoon
+		out, _ := exec.Command("pgrep", "-x", "Hammerspoon").Output()
+		if len(strings.TrimSpace(string(out))) > 0 {
+			return fmt.Sprintf("%s✓ Hammerspoon running — check your init.lua maps media keys to mpdl%s", ColorGreen, Reset)
+		}
+		// Check BetterTouchTool
+		out, _ = exec.Command("pgrep", "-x", "BetterTouchTool").Output()
+		if len(strings.TrimSpace(string(out))) > 0 {
+			return fmt.Sprintf("%s✓ BetterTouchTool running%s", ColorGreen, Reset)
+		}
+		return fmt.Sprintf("%s⚠ no media key tool detected — run: mpdl mediakeys%s", ColorYellow, Reset)
+
+	default:
+		return fmt.Sprintf("%sunsupported platform%s", ColorGray, Reset)
 	}
 }
 
@@ -1924,37 +2211,6 @@ func isConnectionErr(err error) bool {
 		strings.Contains(s, "broken pipe")
 }
 
-func runMonitor(state *AppState) error {
-	log.Printf("🎵 MPD Monitor  %s:%s", state.config.MPD.Host, state.config.MPD.Port)
-	if state.gntpEnabled {
-		log.Printf("📢 GNTP  %s:%d  (icon: %s)", state.config.GNTP.Host, state.config.GNTP.Port, state.config.GNTP.IconMode)
-	} else {
-		log.Println("📢 Notifications: disabled")
-	}
-	if state.debug {
-		log.Println("🐛 Debug: on")
-	}
-	fmt.Println(strings.Repeat("=", getTerminalWidth()))
-	_ = checkStatus(state)
-
-	for {
-		err := monitorOnce(state)
-		if err != nil && (isConnectionErr(err) || strings.Contains(err.Error(), "watcher")) {
-			if state.debug {
-				log.Printf("🔄 Reconnecting: %v", err)
-			}
-			time.Sleep(2 * time.Second)
-			if err := state.client.reconnect(); err != nil {
-				time.Sleep(5 * time.Second)
-			}
-			continue
-		}
-		if err != nil {
-			return err
-		}
-		time.Sleep(2 * time.Second)
-	}
-}
 
 // ──────────────────────────────────────────────
 // Config file discovery
@@ -2400,9 +2656,8 @@ func main() {
 			log.Fatal("❌ Usage: mpdl add PATH")
 		}
 		path := resolveLocalPath(strings.Join(cargs, " "))
-
 		if err := client.Add(path); err != nil {
-			messages = append(messages, fmt.Sprintf("%s❌ Add failed: %s%s, %s%s%s", ColorRed, err, Reset, ColorYellow, path, Reset))
+			messages = append(messages, fmt.Sprintf("%s❌ Add failed: %s%s", ColorRed, err, Reset))
 		} else {
 			messages = append(messages, fmt.Sprintf("%s✅ Added: %s%s", ColorGreen, path, Reset))
 		}
@@ -2432,53 +2687,54 @@ func main() {
 		fmt.Printf("%s✅ Inserted next: %s%s\n", ColorGreen, path, Reset)
 
 	case "del", "delete", "rm-track":
-	    if len(cargs) == 0 {
-	        log.Fatal("❌ Usage: mpdl del <pos|range|/regex/|glob|text|path>")
-	    }
-	    for _, c := range cargs {
-	        // First, check if it's a file or directory path that exists
-	        info, err := os.Stat(c)
-	        if err == nil {
-	            // Path exists
-	            if info.IsDir() {
-	                path := strings.Trim(c, "\"'")
-	                path = resolveLocalPath(path)
-	                deleted, err := client.Delete(path)
-	                if err != nil || deleted == 0 {
-	                    messages = append(messages, fmt.Sprintf("\033[37;41mFailed to delete: '%s'%s", path, Reset))
-	                }
-	                if err != nil {
-	                    messages = append(messages, fmt.Sprintf("\033[37;41mError: %v%s", err, Reset))
-	                }
-	            } else {
-	                // It's a file, treat like other patterns
-	                arg := strings.Trim(c, "\"'")
-	                deleted, err := client.Delete(arg)
-	                if err != nil {
-	                    messages = append(messages, fmt.Sprintf("%s❌ Delete failed: %v%s", ColorRed, err, Reset))
-	                } else if deleted == 0 {
-	                    messages = append(messages, fmt.Sprintf("%s⚠ No tracks matched: %q%s", ColorYellow, arg, Reset))
-	                } else {
-	                    messages = append(messages, fmt.Sprintf("%s✅ Deleted %d track(s) matching %q%s", ColorGreen, deleted, arg, Reset))
-	                }
-	            }
-	        } else {
-	            // Path doesn't exist, treat as position/range/regex/glob/text
-	            arg := strings.Trim(c, "\"'")
-	            deleted, err := client.Delete(arg)
-	            if err != nil {
-	                messages = append(messages, fmt.Sprintf("%s❌ Delete failed: %v%s", ColorRed, err, Reset))
-	            } else if deleted == 0 {
-	                messages = append(messages, fmt.Sprintf("%s⚠ No tracks matched: %q%s", ColorYellow, arg, Reset))
-	            } else {
-	                messages = append(messages, fmt.Sprintf("%s✅ Deleted %d track(s) matching %q%s", ColorGreen, deleted, arg, Reset))
-	            }
-	        }
-	    }
-	    
-	    if err := renderPlaylist(client, messages); err != nil {
-	        log.Fatalf("❌ %v", err)
-	    }
+		if len(cargs) == 0 {
+			log.Fatal("❌ Usage: mpdl del <pos|range|/regex/|glob|text|path>")
+		}
+		for _, c := range cargs {
+			// First check if it's a real file or directory path on disk
+			info, statErr := os.Stat(c)
+			if statErr == nil {
+				// Path exists on disk
+				if info.IsDir() {
+					path := strings.Trim(c, "\"'")
+					path = resolveLocalPath(path)
+					deleted, err := client.Delete(path)
+					if err != nil || deleted == 0 {
+						messages = append(messages, fmt.Sprintf("\033[37;41mFailed to delete dir: '%s'%s", path, Reset))
+					}
+					if err != nil {
+						messages = append(messages, fmt.Sprintf("\033[37;41mError: %v%s", err, Reset))
+					} else if deleted > 0 {
+						messages = append(messages, fmt.Sprintf("%s✅ Deleted %d track(s) from dir: '%s'%s", ColorGreen, deleted, path, Reset))
+					}
+				} else {
+					// It's a file on disk
+					arg := strings.Trim(c, "\"'")
+					deleted, err := client.Delete(arg)
+					if err != nil {
+						messages = append(messages, fmt.Sprintf("%s❌ Delete failed: %v%s", ColorRed, err, Reset))
+					} else if deleted == 0 {
+						messages = append(messages, fmt.Sprintf("%s⚠ No tracks matched: %q%s", ColorYellow, arg, Reset))
+					} else {
+						messages = append(messages, fmt.Sprintf("%s✅ Deleted %d track(s) matching %q%s", ColorGreen, deleted, arg, Reset))
+					}
+				}
+			} else {
+				// Path doesn't exist on disk — treat as position/range/regex/glob/text
+				arg := strings.Trim(c, "\"'")
+				deleted, err := client.Delete(arg)
+				if err != nil {
+					messages = append(messages, fmt.Sprintf("%s❌ Delete failed: %v%s", ColorRed, err, Reset))
+				} else if deleted == 0 {
+					messages = append(messages, fmt.Sprintf("%s⚠ No tracks matched: %q%s", ColorYellow, arg, Reset))
+				} else {
+					messages = append(messages, fmt.Sprintf("%s✅ Deleted %d track(s) matching %q%s", ColorGreen, deleted, arg, Reset))
+				}
+			}
+		}
+		if err := renderPlaylist(client, messages); err != nil {
+			log.Fatalf("❌ %v", err)
+		}
 
 	case "clear":
 		if err := client.Clear(); err != nil {
@@ -2866,7 +3122,6 @@ func resolveLocalPath(path string) string {
 			return abs
 		}
 	}
-
 	return path
 }
 
