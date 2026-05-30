@@ -2365,7 +2365,7 @@ func printHelp() {
 %sENVIRONMENT%s
   MPD_HOST  MPD_PORT  MPD_PASSWORD  MPD_TIMEOUT  MPD_MUSIC_ROOT  DEBUG
 
-%s
+
 `, sep,
 		Bold+ColorCyan, Reset, Version,
 		sep,
@@ -2382,9 +2382,7 @@ func printHelp() {
 		Bold+ColorYellow, Reset,
 		Bold+ColorYellow, Reset,
 		Bold+ColorYellow, Reset,
-		Bold+ColorYellow, Reset,
-		Bold+ColorYellow, Reset,
-		sep)
+		Bold+ColorYellow, Reset)
 }
 
 // ──────────────────────────────────────────────
