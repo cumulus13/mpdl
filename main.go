@@ -2357,7 +2357,6 @@ func printHelp() {
 		Bold+ColorYellow, Reset,
 		Bold+ColorYellow, Reset,
 		Bold+ColorYellow, Reset,
-		Bold+ColorYellow, Reset,
 		sep)
 }
 
