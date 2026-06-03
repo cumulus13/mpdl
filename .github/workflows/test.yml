@@ -17,9 +17,9 @@ jobs:
     name: Test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        go-version: ['1.21']
 
     steps:
       - name: Checkout code
@@ -28,7 +28,8 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: ${{ matrix.go-version }}
+          go-version-file: 'go.mod'
+          cache: true
 
       - name: Get dependencies
         run: |
@@ -38,24 +39,23 @@ jobs:
       - name: Run go vet
         run: go vet ./...
 
-      - name: Build
-        run: go build -v ./...
-
-      - name: Test build artifacts
-        run: |
-          go build -o mpdl main.go config_loader.go
+      - name: Build (all source files)
+        env:
+          CGO_ENABLED: 0
+        run: go build -v -o mpdl_test_build .
 
       - name: Verify binary (Unix)
         if: runner.os != 'Windows'
         run: |
-          chmod +x ./mpdl
-          ./mpdl --version
+          chmod +x ./mpdl_test_build
+          ./mpdl_test_build --version
 
       - name: Verify binary (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          .\mpdl.exe --version
+          Rename-Item mpdl_test_build mpdl_test_build.exe -ErrorAction SilentlyContinue
+          .\mpdl_test_build.exe --version
 
   lint:
     name: Lint
@@ -67,10 +67,11 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version-file: 'go.mod'
+          cache: true
 
       - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v4
+        uses: golangci/golangci-lint-action@v6
         with:
           version: latest
           args: --timeout=5m

@@ -14,9 +14,10 @@ jobs:
     name: Build ${{ matrix.os }} ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
         include:
-          # Windows builds
+          # Windows
           - os: windows
             arch: amd64
             runner: windows-latest
@@ -25,8 +26,8 @@ jobs:
             arch: arm64
             runner: windows-latest
             binary: mpdl.exe
-          
-          # Linux builds
+
+          # Linux
           - os: linux
             arch: amd64
             runner: ubuntu-latest
@@ -39,8 +40,8 @@ jobs:
             arch: arm
             runner: ubuntu-latest
             binary: mpdl
-          
-          # macOS builds
+
+          # macOS
           - os: darwin
             arch: amd64
             runner: macos-latest
@@ -57,7 +58,8 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version-file: 'go.mod'
+          cache: true
 
       - name: Get dependencies
         run: |
@@ -70,14 +72,14 @@ jobs:
           GOARCH: ${{ matrix.arch }}
           CGO_ENABLED: 0
         run: |
-          go build -v -ldflags="-s -w -X main.Version=${{ github.ref_name }}" -o ${{ matrix.binary }} main.go config_loader.go
+          go build -v -trimpath -ldflags="-s -w -X main.Version=${{ github.ref_name }}" -o ${{ matrix.binary }} .
 
       - name: Create archive (Windows)
         if: matrix.os == 'windows'
         shell: pwsh
         run: |
           $archiveName = "mpdl-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}.zip"
-          Compress-Archive -Path ${{ matrix.binary }} -DestinationPath $archiveName
+          Compress-Archive -Path ${{ matrix.binary }},README.md,LICENSE -DestinationPath $archiveName
           echo "ARCHIVE_NAME=$archiveName" >> $env:GITHUB_ENV
           echo "ARCHIVE_PATH=$archiveName" >> $env:GITHUB_ENV
 
@@ -85,7 +87,7 @@ jobs:
         if: matrix.os != 'windows'
         run: |
           ARCHIVE_NAME="mpdl-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz"
-          tar -czf $ARCHIVE_NAME ${{ matrix.binary }}
+          tar -czf $ARCHIVE_NAME ${{ matrix.binary }} README.md LICENSE
           echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> $GITHUB_ENV
           echo "ARCHIVE_PATH=$ARCHIVE_NAME" >> $GITHUB_ENV
 
@@ -109,51 +111,59 @@ jobs:
         with:
           path: ./artifacts
 
-      - name: Display structure of downloaded files
-        run: ls -R ./artifacts
+      - name: Create checksums
+        run: |
+          cd artifacts
+          for dir in */; do
+            cd "$dir"
+            for file in *; do
+              sha256sum "$file" >> ../../checksums.txt
+            done
+            cd ..
+          done
+          cd ..
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
-          files: ./artifacts/**/*
+          files: |
+            artifacts/**/*
+            checksums.txt
           draft: false
           prerelease: false
           generate_release_notes: true
           body: |
-            ## MPDL - Advanced MPD CLI Client
+            ## mpdl — Advanced MPD CLI Client
 
             ### Installation
 
-            Download the appropriate binary for your platform:
-            - **Windows**: `mpdl-*-windows-amd64.zip` or `mpdl-*-windows-arm64.zip`
-            - **Linux**: `mpdl-*-linux-amd64.tar.gz`, `mpdl-*-linux-arm64.tar.gz`, or `mpdl-*-linux-arm.tar.gz`
-            - **macOS**: `mpdl-*-darwin-amd64.tar.gz` (Intel) or `mpdl-*-darwin-arm64.tar.gz` (Apple Silicon)
-
-            ### Quick Start
-
+            **Linux / macOS:**
             ```bash
-            # Extract the archive
-            tar -xzf mpdl-*.tar.gz  # Linux/macOS
-            # or
-            unzip mpdl-*.zip        # Windows
-
-            # Run
-            ./mpdl --help
+            tar -xzf mpdl-*-linux-amd64.tar.gz
+            sudo mv mpdl /usr/local/bin/
             ```
 
-            ### Configuration
-
-            Create a config file at `~/.mpdl` (Linux/macOS) or `%USERPROFILE%\.mpdl` (Windows):
-
-            ```
-            MPD_HOST=localhost
-            MPD_PORT=6600
-            MPD_MUSIC_ROOT=/path/to/music
-            GNTP_ENABLED=true
+            **Windows:**
+            ```powershell
+            # Extract mpdl-*-windows-amd64.zip and add to PATH
             ```
 
-            ### Changes in this Release
+            **Verify checksum:**
+            ```bash
+            sha256sum -c checksums.txt
+            ```
 
-            See full changelog below.
+            ### Platforms
+            | Platform | File |
+            |---|---|
+            | Windows x64 | `mpdl-*-windows-amd64.zip` |
+            | Windows ARM64 | `mpdl-*-windows-arm64.zip` |
+            | Linux x64 | `mpdl-*-linux-amd64.tar.gz` |
+            | Linux ARM64 | `mpdl-*-linux-arm64.tar.gz` |
+            | Linux ARM | `mpdl-*-linux-arm.tar.gz` |
+            | macOS Intel | `mpdl-*-darwin-amd64.tar.gz` |
+            | macOS Apple Silicon | `mpdl-*-darwin-arm64.tar.gz` |
+
+            See [CHANGELOG.md](CHANGELOG.md) for what changed.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
