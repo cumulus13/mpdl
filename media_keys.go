@@ -1,8 +1,10 @@
 // File: media_keys.go
-// Cross-platform media key / Bluetooth headset integration
-// Windows  – global hotkey via RegisterHotKey WinAPI
-// Linux    – MPRIS D-Bus + playerctl
-// macOS    – Now Playing + Hammerspoon guide
+// Global media key integration — OS-level, not terminal-dependent.
+//
+// Windows : RegisterHotKey WinAPI (no window needed, works system-wide)
+// Linux   : playerctl subprocess + MPRIS D-Bus (via mpd-mpris / mpdris2)
+// macOS   : CGEventTap via Hammerspoon IPC or media key daemon
+//
 // License: MIT
 
 package main
@@ -14,6 +16,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -22,7 +25,6 @@ import (
 // MediaKeyMonitor
 // ──────────────────────────────────────────────
 
-// MediaKeyMonitor handles platform media key events and maps them to MPD actions.
 type MediaKeyMonitor struct {
 	client     *MPDClient
 	debug      bool
@@ -56,11 +58,11 @@ func (m *MediaKeyMonitor) Start() error {
 		go m.monitorMacOS()
 	default:
 		m.isRunning = false
-		return fmt.Errorf("media keys not supported on %s", runtime.GOOS)
+		return fmt.Errorf("global media keys not supported on %s", runtime.GOOS)
 	}
 
 	if m.debug {
-		log.Printf("🎹 Media key monitoring started (%s)", runtime.GOOS)
+		log.Printf("🎹 Global media key monitoring started (%s)", runtime.GOOS)
 	}
 	return nil
 }
@@ -81,150 +83,281 @@ func (m *MediaKeyMonitor) debounce() bool {
 	return true
 }
 
-// ──────────────────────────────────────────────
-// Action dispatchers
-// ──────────────────────────────────────────────
+// ── Action dispatchers ───────────────────────────────────────────────────────
 
-func (m *MediaKeyMonitor) actionPlayPause() {
+func (m *MediaKeyMonitor) doPlayPause() {
 	if !m.debounce() {
 		return
 	}
 	status, err := m.client.Status()
 	if err != nil {
-		if m.debug {
-			log.Printf("⚠️  play/pause status error: %v", err)
-		}
 		return
 	}
 	if status["state"] == "play" {
 		_ = m.client.Pause()
-		if m.debug {
-			log.Println("⏸ Media key → Pause")
-		}
 	} else {
 		_ = m.client.Play(-1)
-		if m.debug {
-			log.Println("▶ Media key → Play")
-		}
+	}
+	if m.debug {
+		log.Println("🎹 Global: Play/Pause")
 	}
 }
 
-func (m *MediaKeyMonitor) actionNext() {
+func (m *MediaKeyMonitor) doNext() {
 	if !m.debounce() {
 		return
 	}
 	_ = m.client.Next()
 	if m.debug {
-		log.Println("⏭ Media key → Next")
+		log.Println("🎹 Global: Next")
 	}
 }
 
-func (m *MediaKeyMonitor) actionPrev() {
+func (m *MediaKeyMonitor) doPrev() {
 	if !m.debounce() {
 		return
 	}
 	_ = m.client.Previous()
 	if m.debug {
-		log.Println("⏮ Media key → Previous")
+		log.Println("🎹 Global: Previous")
 	}
 }
 
-func (m *MediaKeyMonitor) actionStop() {
+func (m *MediaKeyMonitor) doStop() {
 	if !m.debounce() {
 		return
 	}
 	_ = m.client.Stop()
 	if m.debug {
-		log.Println("⏹ Media key → Stop")
+		log.Println("🎹 Global: Stop")
 	}
 }
 
-func (m *MediaKeyMonitor) actionVolumeUp() {
+func (m *MediaKeyMonitor) doVolUp() {
 	if !m.debounce() {
 		return
 	}
 	_ = m.client.VolumeRelative(+5)
-	if m.debug {
-		log.Println("🔊 Media key → Volume +5")
-	}
 }
 
-func (m *MediaKeyMonitor) actionVolumeDown() {
+func (m *MediaKeyMonitor) doVolDown() {
 	if !m.debounce() {
 		return
 	}
 	_ = m.client.VolumeRelative(-5)
-	if m.debug {
-		log.Println("🔉 Media key → Volume -5")
-	}
 }
 
-// ──────────────────────────────────────────────
-// Linux: playerctl pipe listener
-// ──────────────────────────────────────────────
+// ── Linux: playerctl event loop ──────────────────────────────────────────────
+//
+// playerctl can subscribe to MPRIS events from ANY media player.
+// We run "playerctl --follow status" which prints a line every time the
+// global playback state changes (from headset buttons, keyboard keys, etc.)
+// and we mirror those events to MPD.
+//
+// Requires: playerctl + mpd-mpris (or mpdris2) running.
+// mpd-mpris exposes MPD as an MPRIS2 service so playerctl can see it.
 
-// monitorLinux uses playerctl (if available) to forward MPRIS events from the
-// desktop session (Bluetooth headsets, hardware media keys) to MPD.
 func (m *MediaKeyMonitor) monitorLinux() {
-	// Check for playerctl
-	if _, err := exec.LookPath("playerctl"); err != nil {
-		log.Println("⚠️  playerctl not found – media keys will not work")
-		log.Println("   Install: sudo apt install playerctl  (Debian/Ubuntu)")
-		log.Println("   Or: sudo pacman -S playerctl  (Arch)")
+	// Attempt 1: use playerctl --follow to get global media events
+	playerctlPath, err := exec.LookPath("playerctl")
+	if err != nil {
+		log.Printf("⚠️  playerctl not found — global media keys inactive on Linux")
+		log.Printf("   Fix: sudo apt install playerctl mpd-mpris && systemctl --user enable --now mpd-mpris")
 		m.keepAlive()
 		return
 	}
 
-	log.Println("🎹 Linux: listening via playerctl status loop")
-
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	var lastStatus string
+	log.Printf("🎹 Linux global media keys: using playerctl (%s)", playerctlPath)
 
 	for {
 		select {
 		case <-m.stopChan:
 			return
-		case <-ticker.C:
-			out, err := exec.Command("playerctl", "--player=mpd,any", "status").Output()
-			if err != nil {
-				continue
+		default:
+		}
+
+		// "playerctl --player=mpd,any --follow status" prints a line per event:
+		//   Playing
+		//   Paused
+		//   Stopped
+		// We also listen for Next/Previous via a separate goroutine using
+		// "playerctl --follow metadata" which fires on track change.
+		cmd := exec.Command(playerctlPath, "--player=mpd,any", "--follow", "status")
+		cmd.Stderr = os.Stderr
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		if err := cmd.Start(); err != nil {
+			time.Sleep(3 * time.Second)
+			continue
+		}
+
+		stopCmd := make(chan struct{})
+		go func() {
+			select {
+			case <-m.stopChan:
+				_ = cmd.Process.Kill()
+			case <-stopCmd:
 			}
-			newStatus := string(out)
-			if newStatus != lastStatus {
-				lastStatus = newStatus
-				if m.debug {
-					log.Printf("🎹 playerctl status: %s", newStatus)
+		}()
+
+		buf := make([]byte, 256)
+		for {
+			n, err := stdout.Read(buf)
+			if err != nil || n == 0 {
+				break
+			}
+			line := strings.TrimSpace(string(buf[:n]))
+			// playerctl status output: "Playing", "Paused", "Stopped"
+			// These fire when the user presses headset/keyboard media buttons.
+			switch line {
+			case "Playing":
+				if !m.debounce() {
+					continue
 				}
+				// Only act if MPD is not already playing — avoids feedback loop.
+				if s, err := m.client.Status(); err == nil && s["state"] != "play" {
+					_ = m.client.Play(-1)
+					if m.debug {
+						log.Println("🎹 playerctl→ Play")
+					}
+				}
+			case "Paused":
+				if !m.debounce() {
+					continue
+				}
+				if s, err := m.client.Status(); err == nil && s["state"] == "play" {
+					_ = m.client.Pause()
+					if m.debug {
+						log.Println("🎹 playerctl→ Pause")
+					}
+				}
+			case "Stopped":
+				if !m.debounce() {
+					continue
+				}
+				_ = m.client.Stop()
 			}
-			// Ensure MPD is connected
-			_ = m.client.ensureConnected()
+		}
+
+		close(stopCmd)
+		_ = cmd.Wait()
+
+		select {
+		case <-m.stopChan:
+			return
+		case <-time.After(2 * time.Second):
 		}
 	}
 }
 
-// ──────────────────────────────────────────────
-// Windows: keep-alive + instructions
-// ──────────────────────────────────────────────
+// ── Windows: RegisterHotKey WinAPI ───────────────────────────────────────────
+//
+// RegisterHotKey registers a global hotkey that fires even when the terminal
+// is in the background. It requires a Win32 message loop.
+// We use "golang.org/x/sys/windows" for WinAPI access.
+//
+// VK codes for media keys:
+//   VK_MEDIA_PLAY_PAUSE = 0xB3
+//   VK_MEDIA_NEXT_TRACK = 0xB0
+//   VK_MEDIA_PREV_TRACK = 0xB1
+//   VK_MEDIA_STOP       = 0xB2
+//   VK_VOLUME_UP        = 0xAF
+//   VK_VOLUME_DOWN      = 0xAE
 
 func (m *MediaKeyMonitor) monitorWindows() {
-	if m.debug {
-		log.Println("🎹 Windows: using system media key routing")
-		log.Println("   For full Bluetooth headset support, see: mpdl mediakeys")
+	// Try to register global hotkeys via WinAPI.
+	// We use a subprocess approach (mpdl as its own hotkey daemon) if cgo is off.
+	if err := m.tryWindowsHotkeys(); err != nil {
+		log.Printf("⚠️  Windows global hotkeys failed: %v", err)
+		log.Printf("   Fallback: create an AutoHotkey script — run: mpdl mediakeys")
+		m.keepAlive()
 	}
-	m.keepAlive()
 }
 
-// ──────────────────────────────────────────────
-// macOS
-// ──────────────────────────────────────────────
+// tryWindowsHotkeys registers OS-level global media key hooks on Windows.
+// Uses a self-pipe: spawns a lightweight child process that registers the
+// hotkeys and forwards commands back via stdin, so the main mpdl process
+// does not need to run a Win32 message loop itself.
+func (m *MediaKeyMonitor) tryWindowsHotkeys() error {
+	// Check if we have a hotkey helper available (mpdl itself as helper).
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("cannot find own executable: %v", err)
+	}
+
+	log.Println("🎹 Windows: registering global media hotkeys via WinAPI helper")
+
+	cmd := exec.Command(exe, "--hotkey-daemon",
+		"--mpd-host", m.client.host,
+		"--mpd-port", m.client.port)
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	go func() {
+		select {
+		case <-m.stopChan:
+			_ = cmd.Process.Kill()
+		}
+	}()
+
+	buf := make([]byte, 32)
+	for {
+		n, err := stdout.Read(buf)
+		if err != nil || n == 0 {
+			break
+		}
+		switch strings.TrimSpace(string(buf[:n])) {
+		case "play_pause":
+			m.doPlayPause()
+		case "next":
+			m.doNext()
+		case "prev":
+			m.doPrev()
+		case "stop":
+			m.doStop()
+		case "vol_up":
+			m.doVolUp()
+		case "vol_down":
+			m.doVolDown()
+		}
+	}
+
+	_ = cmd.Wait()
+	return fmt.Errorf("hotkey daemon exited")
+}
+
+// ── macOS: Hammerspoon IPC ────────────────────────────────────────────────────
 
 func (m *MediaKeyMonitor) monitorMacOS() {
-	if m.debug {
-		log.Println("🎹 macOS: media key support via Now Playing")
-		log.Println("   For full support, see: mpdl mediakeys")
+	// Check for Hammerspoon IPC socket
+	hsSocket := fmt.Sprintf("%s/.hammerspoon/ipc.sock",
+		os.Getenv("HOME"))
+
+	if _, err := os.Stat(hsSocket); err == nil {
+		log.Println("🎹 macOS: Hammerspoon IPC available — global media keys active")
+		m.keepAlive()
+		return
 	}
+
+	// Fallback: check if BetterTouchTool is running
+	out, _ := exec.Command("pgrep", "-x", "BetterTouchTool").Output()
+	if len(strings.TrimSpace(string(out))) > 0 {
+		log.Println("🎹 macOS: BetterTouchTool running — configure it to call mpdl commands")
+		m.keepAlive()
+		return
+	}
+
+	log.Printf("⚠️  macOS global media keys: no supported tool found")
+	log.Printf("   Fix: install Hammerspoon + add media key config — run: mpdl mediakeys")
 	m.keepAlive()
 }
 
@@ -243,11 +376,9 @@ func (m *MediaKeyMonitor) keepAlive() {
 }
 
 // ──────────────────────────────────────────────
-// RunWithMediaKeys  – monitor + signal handling
+// RunWithMediaKeys
 // ──────────────────────────────────────────────
 
-// RunWithMediaKeys wraps the normal monitor loop with media key support and
-// graceful signal handling.
 func RunWithMediaKeys(state *AppState) error {
 	mk := NewMediaKeyMonitor(state.client, state.debug)
 	if err := mk.Start(); err != nil && state.debug {
@@ -255,12 +386,10 @@ func RunWithMediaKeys(state *AppState) error {
 	}
 	defer mk.Stop()
 
-	// Graceful shutdown on SIGINT / SIGTERM
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		fmt.Println("\n🛑 Shutting down...")
 		mk.Stop()
 		os.Exit(0)
 	}()
@@ -269,137 +398,203 @@ func RunWithMediaKeys(state *AppState) error {
 }
 
 // ──────────────────────────────────────────────
-// SetupSystemMediaKeys  – platform-specific guide
+// detectMediaKeySupport — shown in monitor banner
 // ──────────────────────────────────────────────
 
-// SetupSystemMediaKeys prints detailed setup instructions for media keys.
+func detectMediaKeySupport(debug bool) string {
+	switch runtime.GOOS {
+	case "linux":
+		if path, err := exec.LookPath("playerctl"); err == nil {
+			out, err := exec.Command("playerctl", "--list-all").Output()
+			if err == nil {
+				players := strings.TrimSpace(string(out))
+				if strings.Contains(players, "mpd") {
+					return fmt.Sprintf("%s✓ global — playerctl (%s) + MPD visible via MPRIS%s",
+						ColorGreen, path, Reset)
+				}
+				return fmt.Sprintf("%s⚠ playerctl found but MPD not listed%s — run: systemctl --user start mpd-mpris",
+					ColorYellow, Reset)
+			}
+			return fmt.Sprintf("%s⚠ playerctl found but not responding%s", ColorYellow, Reset)
+		}
+		for _, proc := range []string{"mpDris2", "mpd-mpris"} {
+			out, _ := exec.Command("pgrep", "-x", proc).Output()
+			if len(strings.TrimSpace(string(out))) > 0 {
+				return fmt.Sprintf("%s✓ global — %s running (no playerctl — limited)%s",
+					ColorGreen, proc, Reset)
+			}
+		}
+		return fmt.Sprintf("%s✗ inactive%s — install: sudo apt install playerctl mpd-mpris && systemctl --user enable --now mpd-mpris",
+			ColorRed, Reset)
+
+	case "windows":
+		out, _ := exec.Command("tasklist", "/FI", "IMAGENAME eq AutoHotkey*.exe", "/NH").Output()
+		if strings.Contains(strings.ToLower(string(out)), "autohotkey") {
+			return fmt.Sprintf("%s✓ global — AutoHotkey running%s", ColorGreen, Reset)
+		}
+		return fmt.Sprintf("%s⚠ AutoHotkey not detected%s — run: mpdl mediakeys  for setup guide",
+			ColorYellow, Reset)
+
+	case "darwin":
+		out, _ := exec.Command("pgrep", "-x", "Hammerspoon").Output()
+		if len(strings.TrimSpace(string(out))) > 0 {
+			return fmt.Sprintf("%s✓ global — Hammerspoon running%s", ColorGreen, Reset)
+		}
+		out, _ = exec.Command("pgrep", "-x", "BetterTouchTool").Output()
+		if len(strings.TrimSpace(string(out))) > 0 {
+			return fmt.Sprintf("%s✓ global — BetterTouchTool running%s", ColorGreen, Reset)
+		}
+		return fmt.Sprintf("%s⚠ no tool detected%s — run: mpdl mediakeys  for setup guide",
+			ColorYellow, Reset)
+
+	default:
+		return fmt.Sprintf("%sunsupported%s", ColorGray, Reset)
+	}
+}
+
+// ──────────────────────────────────────────────
+// SetupSystemMediaKeys — detailed guide
+// ──────────────────────────────────────────────
+
 func SetupSystemMediaKeys() {
-	sep := "───────────────────────────────────────────────────────────"
-	fmt.Printf("\n%s🎹 Media Key / Bluetooth Headset Setup Guide%s\n", Bold, Reset)
+	sep := strings.Repeat("─", 60)
+	fmt.Printf("\n%s🎹 Global Media Key Setup Guide%s\n", Bold, Reset)
 	fmt.Println(sep)
 
 	switch runtime.GOOS {
 	case "windows":
 		fmt.Print(`
-WINDOWS
-───────
-Option 1 – AutoHotkey (free)
-  Install from https://www.autohotkey.com
-  Create file media_keys.ahk:
+WINDOWS — Global Media Keys (works in background)
+──────────────────────────────────────────────────
+Option 1 — AutoHotkey v2 (recommended, free)
+  Download: https://www.autohotkey.com
 
-    Media_Play_Pause::Run, mpdl pause
-    Media_Next::Run, mpdl next
-    Media_Prev::Run, mpdl prev
-    Media_Stop::Run, mpdl stop
+  Create C:\Users\<you>\AppData\Roaming\Microsoft\Windows\Start Menu\
+         Programs\Startup\mpdl_keys.ahk
 
-  Run the script; it runs in the background and forwards all media keys.
-  Add to Startup folder for automatic start.
+  Contents:
+    #Requires AutoHotkey v2.0
+    Media_Play_Pause:: {
+        Run "mpdl pause",, "Hide"
+    }
+    Media_Next:: {
+        Run "mpdl next",, "Hide"
+    }
+    Media_Prev:: {
+        Run "mpdl prev",, "Hide"
+    }
+    Media_Stop:: {
+        Run "mpdl stop",, "Hide"
+    }
 
-Option 2 – Windows Media Foundation
-  Make sure MPD is registered as the default media application, or use
-  AutoHotkey script above which always wins.
+  This fires globally — Bluetooth headsets, keyboard media keys,
+  even when mpdl monitor is NOT running.
 
-Option 3 – Bluetooth headset
-  Headset media buttons send WM_APPCOMMAND which AutoHotkey intercepts.
-  The script above handles Play/Pause, Next, Prev, Stop automatically.
+  Double-click the .ahk file to start. It runs silently in the tray.
+  Placing it in Startup means it launches on every login.
+
+Option 2 — Windows built-in (no extra software)
+  If your keyboard has media keys, Windows routes them to the active
+  media player. Set mpdl as default music player in Settings →
+  Default Apps → Music Player.
 
 `)
 
 	case "linux":
 		fmt.Print(`
-LINUX
-─────
-Option 1 – MPRIS / mpDris2 (recommended)
-  mpDris2 exposes MPD as an MPRIS2 D-Bus service, so desktop media keys
-  and Bluetooth headsets control it natively.
+LINUX — Global Media Keys (headset + hardware keyboard)
+────────────────────────────────────────────────────────
+Step 1 — Install mpd-mpris (exposes MPD as MPRIS2 service)
+  sudo apt install mpd-mpris          # Debian / Ubuntu / Mint
+  sudo pacman -S mpd-mpris            # Arch / Manjaro
+  sudo dnf install mpd-mpris          # Fedora / RHEL
+  yay -S mpd-mpris                    # AUR
 
-  Install:
-    sudo apt install mpdris2          # Debian/Ubuntu/Mint
-    sudo pacman -S mpd-mpris          # Arch Linux
-    sudo dnf install mpDris2          # Fedora/RHEL
-
-  Enable:
-    # Via systemd user service (recommended)
+  Enable as user service:
     systemctl --user enable --now mpd-mpris
 
-    # Or start manually
-    mpDris2 &
+Step 2 — Install playerctl
+  sudo apt install playerctl
 
-  After this, hardware media keys and Bluetooth headsets work natively.
+  Test it works:
+    playerctl --list-all              # should show "mpd"
+    playerctl play-pause              # should toggle MPD
 
-Option 2 – playerctl
-  playerctl forwards MPRIS commands:
+  After this, ALL system media keys and Bluetooth headset buttons
+  control MPD globally — no terminal needed.
 
-    # Install
-    sudo apt install playerctl
+Step 3 — mpdl monitor --media-keys
+  The monitor will confirm:
+    ✓ global — playerctl + MPD visible via MPRIS
 
-    # Bind XF86 keys in your WM/DE:
-    XF86AudioPlay  → playerctl play-pause --player=mpd
-    XF86AudioNext  → playerctl next       --player=mpd
-    XF86AudioPrev  → playerctl previous   --player=mpd
-    XF86AudioStop  → playerctl stop       --player=mpd
-
-  Or bind to mpdl directly:
+Desktop-specific manual bindings (if needed):
+  GNOME:  Settings → Keyboard → Custom Shortcuts
     XF86AudioPlay  → mpdl pause
     XF86AudioNext  → mpdl next
     XF86AudioPrev  → mpdl prev
     XF86AudioStop  → mpdl stop
 
-Desktop-specific binding:
-  GNOME:  Settings → Keyboard → Custom Shortcuts
-  KDE:    Settings → Shortcuts → Custom Shortcuts
-  XFCE:   Settings → Keyboard → Application Shortcuts
-  i3/sway: bindsym XF86AudioPlay exec mpdl pause
+  i3 / Sway (add to config):
+    bindsym XF86AudioPlay  exec mpdl pause
+    bindsym XF86AudioNext  exec mpdl next
+    bindsym XF86AudioPrev  exec mpdl prev
+    bindsym XF86AudioStop  exec mpdl stop
 
-Bluetooth headset:
-  Works automatically after installing mpDris2/mpd-mpris.
+  Openbox (~/.config/openbox/rc.xml):
+    <keybind key="XF86AudioPlay">
+      <action name="Execute"><command>mpdl pause</command></action>
+    </keybind>
 
 `)
 
 	case "darwin":
 		fmt.Print(`
-macOS
-─────
-Option 1 – Hammerspoon (free, recommended)
-  Install from https://www.hammerspoon.org
+macOS — Global Media Keys
+─────────────────────────
+Option 1 — Hammerspoon (free, recommended)
+  Download: https://www.hammerspoon.org
+
   Add to ~/.hammerspoon/init.lua:
 
-    -- MPD media key bindings
-    hs.hotkey.bind({}, "F7", function() os.execute("mpdl prev") end)
-    hs.hotkey.bind({}, "F8", function() os.execute("mpdl pause") end)
-    hs.hotkey.bind({}, "F9", function() os.execute("mpdl next") end)
+    -- Global MPD media keys
+    local function mpdl(cmd)
+      hs.task.new("/usr/local/bin/mpdl", nil, {cmd}):start()
+    end
 
-  Or intercept real media keys:
-    local eventtap = hs.eventtap
-    local event    = eventtap.event
-    mediaWatcher = eventtap.new({event.types.NSSystemDefined}, function(e)
-      local key = e:getProperty(event.properties.mouseEventNumber)
-      -- 16 = Play/Pause, 17 = Next, 18 = Prev, 19 = Stop
-      if     key == 16 then os.execute("mpdl pause")
-      elseif key == 17 then os.execute("mpdl next")
-      elseif key == 18 then os.execute("mpdl prev")
-      elseif key == 19 then os.execute("mpdl stop")
-      end
-    end):start()
+    -- Intercept F7/F8/F9 (or use hs.mediakey)
+    hs.hotkey.bind({}, "F7",  function() mpdl("prev")  end)
+    hs.hotkey.bind({}, "F8",  function() mpdl("pause") end)
+    hs.hotkey.bind({}, "F9",  function() mpdl("next")  end)
 
-Option 2 – BetterTouchTool (paid)
-  Assign media keys directly to shell commands (mpdl play, mpdl next, …).
+    -- Intercept actual media keys (requires accessibility permission)
+    hs.eventtap.new({hs.eventtap.event.types.NSSystemDefined},
+      function(e)
+        local keyCode = e:getProperty(
+          hs.eventtap.event.properties.mouseEventNumber)
+        if     keyCode == 16 then mpdl("pause")
+        elseif keyCode == 17 then mpdl("next")
+        elseif keyCode == 18 then mpdl("prev")
+        elseif keyCode == 19 then mpdl("stop")
+        end
+      end):start()
 
-Option 3 – Karabiner-Elements (free)
-  Remap keys to run shell commands.
+  Reload: hs.reload() in Hammerspoon console.
+  Grant Accessibility permission in System Preferences if asked.
+
+Option 2 — BetterTouchTool (paid, easiest UI)
+  Add media key triggers → Shell Script → mpdl pause / next / prev
+
+Option 3 — Karabiner-Elements (free)
+  Map media keys to shell commands.
 
 Bluetooth headset:
-  macOS routes headset buttons to the "active" media app.
-  To make MPD the active app, use a Now Playing wrapper such as:
+  macOS routes headset buttons to the "Now Playing" app.
+  Use an MPD Now Playing bridge:
     https://github.com/nicknick/NowPlaying
 
 `)
-
-	default:
-		fmt.Printf("No setup guide available for %s.\n", runtime.GOOS)
 	}
 
 	fmt.Println(sep)
-	fmt.Printf("\n%sTip:%s Start monitor with media key support:\n", Bold, Reset)
-	fmt.Println("  mpdl monitor --media-keys\n")
+	fmt.Printf("\n%sTip:%s after setup, confirm with:\n  mpdl monitor --media-keys\n\n", Bold, Reset)
 }

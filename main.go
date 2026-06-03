@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
@@ -326,44 +325,43 @@ type queueEntry struct {
 	file  string // used as tie-breaker
 }
 
-// AddAndPlay clears the queue, adds path (file or folder), sorts the resulting
-// queue by Disc→Track tag order, then plays from position 0.
+// AddAndPlay adds path (file or folder) to the END of the current queue,
+// sorts only the newly-added tracks by Disc→Track tag, then plays the
+// first of those newly-added tracks.
 //
-// Why sorting is necessary
-// ────────────────────────
-// MPD's "add <dir>" appends files in filesystem/directory-walk order, which is
-// almost always alphabetical by filename — not by the Track/Disc metadata tags.
-// A folder like:
-//
-//	02 - Song Two.flac        ← added first  (pos 0)
-//	01 - Song One.flac        ← added second (pos 1)
-//
-// would start at track 2 without this reorder step.
+// It does NOT clear the existing queue — the current playlist is preserved
+// and the new album/folder is appended after it.
 func (m *MPDClient) AddAndPlay(path string) error {
 	if err := m.ensureConnected(); err != nil {
 		return err
 	}
 
-	// Step 1 – clear queue and add the requested path atomically.
-	cl := m.client.BeginCommandList()
-	cl.Clear()
-	cl.Add(m.normalizePath(path))
-	if err := cl.End(); err != nil {
-		return fmt.Errorf("addplay clear+add: %v", err)
+	// Step 1 – snapshot the queue length before adding anything.
+	// Everything after this position is what we are about to add.
+	before, err := m.client.PlaylistInfo(-1, -1)
+	if err != nil {
+		return fmt.Errorf("addplay: pre-add playlist read: %v", err)
+	}
+	insertOffset := len(before) // first position of the new tracks
+
+	// Step 2 – add the path (may add many files if it is a directory).
+	if err := m.client.Add(m.normalizePath(path)); err != nil {
+		return fmt.Errorf("addplay: add %q: %v", path, err)
 	}
 
-	// Step 2 – read back what was just added.
-	playlist, err := m.client.PlaylistInfo(-1, -1)
+	// Step 3 – read back only the newly-added portion.
+	after, err := m.client.PlaylistInfo(-1, -1)
 	if err != nil {
-		return fmt.Errorf("addplay playlist read: %v", err)
+		return fmt.Errorf("addplay: post-add playlist read: %v", err)
 	}
-	if len(playlist) == 0 {
+	newTracks := after[insertOffset:]
+	if len(newTracks) == 0 {
 		return fmt.Errorf("addplay: no tracks found at %q", path)
 	}
 
-	// Step 3 – build a sortable slice keyed by MPD song ID.
-	entries := make([]queueEntry, 0, len(playlist))
-	for _, song := range playlist {
+	// Step 4 – build sortable entries from the newly-added tracks only.
+	entries := make([]queueEntry, 0, len(newTracks))
+	for _, song := range newTracks {
 		id, _ := strconv.Atoi(song["Id"])
 		entries = append(entries, queueEntry{
 			id:    id,
@@ -373,18 +371,18 @@ func (m *MPDClient) AddAndPlay(path string) error {
 		})
 	}
 
-	// Step 4 – sort: Disc asc → Track asc → filename asc.
+	// Step 5 – sort: Disc asc → Track asc → filename asc.
 	sortQueueEntries(entries)
 
-	// Step 5 – reorder the queue in MPD to match the sorted order.
-	// Non-fatal: if reordering fails we still play from position 0,
-	// which may not be track #1 but is better than an error exit.
-	if err := m.reorderQueue(entries); err != nil {
+	// Step 6 – reorder only the new tracks within the queue.
+	// We reorder starting at insertOffset so the existing tracks are untouched.
+	if err := m.reorderQueueFrom(entries, insertOffset); err != nil {
 		log.Printf("⚠️  addplay: reorder failed (playing anyway): %v", err)
 	}
 
-	// Step 6 – play from the first position (Disc 1, Track 1).
-	return m.client.Play(0)
+	// Step 7 – play the first of the newly-added (now sorted) tracks.
+	// entries[0].id is the Disc1/Track1 song after sorting.
+	return m.client.PlayID(entries[0].id)
 }
 
 // parseTrackNum parses MPD tag strings like "1", "01", "1/12" → 1.
@@ -428,15 +426,16 @@ func queueLess(a, b queueEntry) bool {
 // avoiding a full PlaylistInfo round-trip after every Move.
 // reorderQueue issues MoveID commands to bring the MPD queue into the order
 // described by entries (sorted by disc/track).
-//
-// We use MoveID (move by stable song ID) rather than Move (move by position)
-// because MoveID's target is always the final position — MPD re-indexes
-// everything after each call, so we never need to track position drift ourselves.
 func (m *MPDClient) reorderQueue(entries []queueEntry) error {
-	// Issue one MoveID per song. MPD handles all position re-indexing internally.
-	// We iterate in order 0, 1, 2, … so each song is placed at its correct
-	// final position before we move on to the next.
-	for targetPos, e := range entries {
+	return m.reorderQueueFrom(entries, 0)
+}
+
+// reorderQueueFrom reorders entries starting at basePos in the queue.
+// Entries before basePos are untouched. This is used by AddAndPlay to
+// sort only the newly-added tracks without disturbing the existing queue.
+func (m *MPDClient) reorderQueueFrom(entries []queueEntry, basePos int) error {
+	for i, e := range entries {
+		targetPos := basePos + i
 		if err := m.client.MoveID(e.id, targetPos); err != nil {
 			return fmt.Errorf("moveid id=%d to pos %d: %v", e.id, targetPos, err)
 		}
@@ -1537,6 +1536,11 @@ func printStatus(client *MPDClient) error {
 		ColorGray, Reset, bitrate,
 		ColorGray, Reset, xfade)
 
+	// ── DB update status (like real mpc) ────────────────────────────
+	if jobID, ok := status["updating_db"]; ok && jobID != "" {
+		fmt.Printf("  %s🔄 Updating DB (job #%s)…%s\n", ColorYellow, jobID, Reset)
+	}
+
 	fmt.Println(sep)
 	return nil
 }
@@ -1689,6 +1693,7 @@ type AppState struct {
 	showProgress bool // whether to render progress bar in monitor output
 	lastSongFile string
 	lastState    string
+	lastDbJob    string // tracks DB update job ID; "" means not updating
 }
 
 func setupGNTP(cfg *Config, debug bool) (*gntp.Client, bool) {
@@ -1713,7 +1718,8 @@ func setupGNTP(cfg *Config, debug bool) (*gntp.Client, bool) {
 
 	sc := gntp.NewNotificationType("song_change").WithDisplayName("Song Changed")
 	ps := gntp.NewNotificationType("player_state").WithDisplayName("Player State")
-	if err := c.Register([]*gntp.NotificationType{sc, ps}); err != nil {
+	db := gntp.NewNotificationType("db_update").WithDisplayName("Database Update")
+	if err := c.Register([]*gntp.NotificationType{sc, ps, db}); err != nil {
 		if debug {
 			log.Printf("⚠️  GNTP register failed: %v", err)
 		}
@@ -1872,7 +1878,7 @@ func runMonitor(state *AppState) error {
 			watcher, err := mpd.NewWatcher("tcp",
 				fmt.Sprintf("%s:%s", state.config.MPD.Host, state.config.MPD.Port),
 				state.config.MPD.Password,
-				"player", "mixer", "playlist")
+				"player", "mixer", "playlist", "update", "database")
 			if err != nil {
 				if state.debug {
 					log.Printf("⚠️  watcher: %v", err)
@@ -1970,7 +1976,24 @@ func runMonitor(state *AppState) error {
 		}
 		state.lastState = currentState
 
-		// ── erase previous block ──────────────────────────────────────────
+		// ── DB update tracking + GNTP notification ────────────────────────
+		currentDbJob := status["updating_db"] // non-empty = DB is updating
+		if currentDbJob != state.lastDbJob {
+			if currentDbJob != "" && state.lastDbJob == "" {
+				// Update just started
+				_ = sendNotification(state, "db_update",
+					"🔄 Database Update Started",
+					fmt.Sprintf("MPD is scanning your music library (job #%s)", currentDbJob),
+					nil)
+			} else if currentDbJob == "" && state.lastDbJob != "" {
+				// Update just finished
+				_ = sendNotification(state, "db_update",
+					"✅ Database Update Complete",
+					fmt.Sprintf("Job #%s finished", state.lastDbJob),
+					nil)
+			}
+			state.lastDbJob = currentDbJob
+		}
 		if displayLines > 0 {
 			// Move cursor up N lines, then erase from cursor to end of screen.
 			fmt.Printf("\033[%dA\033[J", displayLines)
@@ -2076,6 +2099,11 @@ func runMonitor(state *AppState) error {
 			addLine(fmt.Sprintf("  %s%s%s", ColorGray, song["file"], Reset))
 		}
 
+		// ── DB update status (shown regardless of play state) ─────────────
+		if dbJob := status["updating_db"]; dbJob != "" {
+			addLine(fmt.Sprintf("  %s🔄 Updating DB (job #%s)…%s", ColorYellow, dbJob, Reset))
+		}
+
 		sb.WriteString(strings.Repeat("─", tw))
 		lines++
 
@@ -2106,12 +2134,10 @@ func runMonitor(state *AppState) error {
 				redraw()
 			}
 
-		case sub := <-eventCh:
-			// MPD event — redraw immediately
-			if sub != "database" && sub != "update" {
-				_ = state.client.ensureConnected()
-				redraw()
-			}
+		case <-eventCh:
+			// MPD event (player/mixer/playlist/update/database) — redraw immediately
+			_ = state.client.ensureConnected()
+			redraw()
 
 		case key := <-keyCh:
 			switch key {
@@ -2151,58 +2177,6 @@ func runMonitor(state *AppState) error {
 
 // detectMediaKeySupport probes for media key infrastructure and returns a
 // human-readable status string shown in the monitor banner.
-func detectMediaKeySupport(debug bool) string {
-	switch runtime.GOOS {
-	case "linux":
-		// Check playerctl
-		if path, err := exec.LookPath("playerctl"); err == nil {
-			// Try to actually query it
-			out, err := exec.Command("playerctl", "--list-all").Output()
-			if err == nil {
-				players := strings.TrimSpace(string(out))
-				if strings.Contains(players, "mpd") {
-					return fmt.Sprintf("%s✓ playerctl (%s) — MPD detected, media keys active%s", ColorGreen, path, Reset)
-				}
-				return fmt.Sprintf("%s⚠ playerctl found (%s) but MPD not listed — run mpDris2 or mpd-mpris%s", ColorYellow, path, Reset)
-			}
-			return fmt.Sprintf("%s⚠ playerctl found but not responding%s", ColorYellow, Reset)
-		}
-		// Check for mpd-mpris / mpdris2 process
-		out, _ := exec.Command("pgrep", "-x", "mpDris2").Output()
-		if len(strings.TrimSpace(string(out))) > 0 {
-			return fmt.Sprintf("%s✓ mpDris2 running — media keys active%s", ColorGreen, Reset)
-		}
-		out, _ = exec.Command("pgrep", "-x", "mpd-mpris").Output()
-		if len(strings.TrimSpace(string(out))) > 0 {
-			return fmt.Sprintf("%s✓ mpd-mpris running — media keys active%s", ColorGreen, Reset)
-		}
-		return fmt.Sprintf("%s✗ not active — install mpd-mpris or playerctl, run: mpdl mediakeys%s", ColorRed, Reset)
-
-	case "windows":
-		// Check AutoHotkey
-		out, _ := exec.Command("tasklist", "/FI", "IMAGENAME eq AutoHotkey*.exe", "/NH").Output()
-		if strings.Contains(strings.ToLower(string(out)), "autohotkey") {
-			return fmt.Sprintf("%s✓ AutoHotkey running — check your script maps media keys to mpdl%s", ColorGreen, Reset)
-		}
-		return fmt.Sprintf("%s⚠ AutoHotkey not detected — media keys may not work, run: mpdl mediakeys%s", ColorYellow, Reset)
-
-	case "darwin":
-		// Check Hammerspoon
-		out, _ := exec.Command("pgrep", "-x", "Hammerspoon").Output()
-		if len(strings.TrimSpace(string(out))) > 0 {
-			return fmt.Sprintf("%s✓ Hammerspoon running — check your init.lua maps media keys to mpdl%s", ColorGreen, Reset)
-		}
-		// Check BetterTouchTool
-		out, _ = exec.Command("pgrep", "-x", "BetterTouchTool").Output()
-		if len(strings.TrimSpace(string(out))) > 0 {
-			return fmt.Sprintf("%s✓ BetterTouchTool running%s", ColorGreen, Reset)
-		}
-		return fmt.Sprintf("%s⚠ no media key tool detected — run: mpdl mediakeys%s", ColorYellow, Reset)
-
-	default:
-		return fmt.Sprintf("%sunsupported platform%s", ColorGray, Reset)
-	}
-}
 
 func isConnectionErr(err error) bool {
 	s := err.Error()
@@ -2365,7 +2339,7 @@ func printHelp() {
 %sENVIRONMENT%s
   MPD_HOST  MPD_PORT  MPD_PASSWORD  MPD_TIMEOUT  MPD_MUSIC_ROOT  DEBUG
 
-
+%s
 `, sep,
 		Bold+ColorCyan, Reset, Version,
 		sep,
@@ -2382,7 +2356,9 @@ func printHelp() {
 		Bold+ColorYellow, Reset,
 		Bold+ColorYellow, Reset,
 		Bold+ColorYellow, Reset,
-		Bold+ColorYellow, Reset)
+		Bold+ColorYellow, Reset,
+		Bold+ColorYellow, Reset,
+		sep)
 }
 
 // ──────────────────────────────────────────────
