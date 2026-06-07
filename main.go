@@ -9,6 +9,7 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"log"
@@ -2275,12 +2276,16 @@ func printHelp() {
   seek [+/-]SECS         Seek (absolute or relative, decimal OK)
 
 %sPLAYLIST%s
-  add PATH               Add file/dir to queue
-  addplay PATH           Clear queue, add PATH, play from track 1
-  insert PATH            Insert after currently playing track
-  del ARG                Delete from queue.  ARG can be:
-                           N        – 1-based position (0 = current)
-                           N-M      – position range  (e.g. 3-7)
+  add PATH [PATH2 ...]   Add file(s)/dir(s) to queue.
+                           PATH can be a file, directory, or local glob.
+                           Use - to read paths from stdin (one per line).
+  addplay PATH [PATH2 ...]  Add, sort by Disc/Track tag, play from track 1.
+                             Extra paths queued after the first.
+  insert PATH [PATH2 ...]   Insert after current track; plays next.
+                             Multiple paths inserted in given order.
+  del ARG [ARG2 ...]     Delete from queue. Each ARG can be:
+                           N        – 1-based position (0 = current track)
+                           N-M      – position range   (e.g. 3-7)
                            /regex/  – regex against title/artist/file
                            glob*    – wildcard/glob pattern
                            text     – substring/path match
@@ -2289,6 +2294,10 @@ func printHelp() {
   shuffle                Shuffle queue
   move <from> <to>       Move track (1-based)
   list, ls, playlist     Show queue
+
+  Pipe support (read from stdin with -):
+    ls /music/Rock/*.flac | mpdl add -
+    cat paths.txt | mpdl del -
 
 %sSAVED PLAYLISTS%s
   save <name>            Save queue as playlist
@@ -2357,12 +2366,100 @@ func printHelp() {
 		Bold+ColorYellow, Reset,
 		Bold+ColorYellow, Reset,
 		Bold+ColorYellow, Reset,
+		Bold+ColorYellow, Reset,
 		sep)
 }
 
 // ──────────────────────────────────────────────
-// main
+// Multi-arg / stdin helpers
 // ──────────────────────────────────────────────
+
+// expandArgs takes the raw CLI args for a path-accepting command and returns
+// a flat, deduplicated list of resolved paths ready to pass to MPD.
+//
+// Each element of args may be:
+//   - "-"           → read newline-separated paths from stdin
+//   - a local glob  → expanded via filepath.Glob (e.g. /music/Rock/*.flac)
+//   - a plain path  → resolved via resolveLocalPath
+//
+// Duplicates are removed while preserving order.
+func expandArgs(args []string) []string {
+	seen := make(map[string]struct{})
+	var out []string
+
+	add := func(p string) {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			return
+		}
+		if _, dup := seen[p]; dup {
+			return
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+
+	for _, a := range args {
+		a = strings.Trim(a, "\"'")
+
+		// ── stdin pipe: mpdl add - ─────────────────────────────────────
+		if a == "-" {
+			scanner := bufio.NewScanner(os.Stdin)
+			for scanner.Scan() {
+				line := strings.TrimSpace(scanner.Text())
+				if line != "" && !strings.HasPrefix(line, "#") {
+					add(resolveLocalPath(line))
+				}
+			}
+			continue
+		}
+
+		// ── local glob expansion ───────────────────────────────────────
+		// Only attempt glob if the arg contains glob characters AND looks
+		// like a local path (starts with /, ./, drive letter, or ~).
+		if strings.ContainsAny(a, "*?[") && looksLikeLocalPath(a) {
+			expanded, err := filepath.Glob(a)
+			if err == nil && len(expanded) > 0 {
+				for _, p := range expanded {
+					add(resolveLocalPath(p))
+				}
+				continue
+			}
+		}
+
+		// ── plain path ─────────────────────────────────────────────────
+		add(resolveLocalPath(a))
+	}
+
+	return out
+}
+
+// looksLikeLocalPath returns true when s appears to be a local filesystem
+// path rather than an MPD-relative path.
+func looksLikeLocalPath(s string) bool {
+	return strings.HasPrefix(s, "/") ||
+		strings.HasPrefix(s, "./") ||
+		strings.HasPrefix(s, "../") ||
+		strings.HasPrefix(s, "~") ||
+		strings.HasPrefix(s, "\\") ||
+		(len(s) >= 2 && s[1] == ':') // Windows C:\...
+}
+
+// readStdinPaths reads newline-separated paths from stdin.
+// Used when the user pipes: echo "path" | mpdl add -
+func readStdinPaths() []string {
+	var paths []string
+	scanner := bufio.NewScanner(os.Stdin)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" && !strings.HasPrefix(line, "#") {
+			paths = append(paths, resolveLocalPath(line))
+		}
+	}
+	return paths
+}
+
+
 
 func main() {
 	var (
@@ -2626,38 +2723,65 @@ func main() {
 
 	case "add":
 		if len(cargs) == 0 {
-			log.Fatal("❌ Usage: mpdl add PATH")
+			log.Fatal("❌ Usage: mpdl add <path|glob|-> [path2 path3 ...]")
 		}
-		path := resolveLocalPath(strings.Join(cargs, " "))
-		if err := client.Add(path); err != nil {
-			messages = append(messages, fmt.Sprintf("%s❌ Add failed: %s%s", ColorRed, err, Reset))
-		} else {
-			messages = append(messages, fmt.Sprintf("%s✅ Added: %s%s", ColorGreen, path, Reset))
+		paths := expandArgs(cargs)
+		if len(paths) == 0 {
+			log.Fatal("❌ No paths to add")
+		}
+		for _, path := range paths {
+			if err := client.Add(path); err != nil {
+				messages = append(messages, fmt.Sprintf("%s❌ Add failed [%s]: %v%s", ColorRed, path, err, Reset))
+			} else {
+				messages = append(messages, fmt.Sprintf("%s✅ Added: %s%s", ColorGreen, path, Reset))
+			}
 		}
 		if err := renderPlaylist(client, messages); err != nil {
 			log.Fatalf("❌ %v", err)
 		}
 
 	case "addplay", "ap":
-		// Clear queue, add path, start from track 1
+		// Add path(s) to queue, sort by track #, play first of what was added.
+		// Multiple paths: each is added in order; the first track of the
+		// first path is played.
 		if len(cargs) == 0 {
-			log.Fatal("❌ Usage: mpdl addplay PATH")
+			log.Fatal("❌ Usage: mpdl addplay <path|glob|-> [path2 ...]")
 		}
-		path := resolveLocalPath(strings.Join(cargs, " "))
-		if err := client.AddAndPlay(path); err != nil {
+		paths := expandArgs(cargs)
+		if len(paths) == 0 {
+			log.Fatal("❌ No paths to add")
+		}
+		// AddAndPlay the first path (adds + sorts + plays)
+		if err := client.AddAndPlay(paths[0]); err != nil {
 			log.Fatalf("❌ addplay: %v", err)
 		}
-		fmt.Printf("%s▶ Queue replaced — Playing: %s%s\n", ColorGreen, path, Reset)
+		// Add any remaining paths to the queue (after the first album)
+		for _, path := range paths[1:] {
+			if err := client.Add(path); err != nil {
+				fmt.Printf("%s⚠ Could not add %q: %v%s\n", ColorYellow, path, err, Reset)
+			} else {
+				fmt.Printf("%s✅ Also queued: %s%s\n", ColorGreen, path, Reset)
+			}
+		}
+		fmt.Printf("%s▶ Playing from: %s%s\n", ColorGreen, paths[0], Reset)
 
 	case "insert":
 		if len(cargs) == 0 {
-			log.Fatal("❌ Usage: mpdl insert PATH")
+			log.Fatal("❌ Usage: mpdl insert <path|glob|-> [path2 ...]")
 		}
-		path := resolveLocalPath(strings.Join(cargs, " "))
-		if err := client.Insert(path); err != nil {
-			log.Fatalf("❌ insert: %v", err)
+		paths := expandArgs(cargs)
+		if len(paths) == 0 {
+			log.Fatal("❌ No paths to insert")
 		}
-		fmt.Printf("%s✅ Inserted next: %s%s\n", ColorGreen, path, Reset)
+		// Insert in reverse order so they end up in the correct sequence
+		// after current: paths[0] plays next, paths[1] after that, etc.
+		for i := len(paths) - 1; i >= 0; i-- {
+			if err := client.Insert(paths[i]); err != nil {
+				fmt.Printf("%s⚠ Could not insert %q: %v%s\n", ColorYellow, paths[i], err, Reset)
+			} else {
+				fmt.Printf("%s✅ Inserted next: %s%s\n", ColorGreen, paths[i], Reset)
+			}
+		}
 
 	case "del", "delete", "rm-track":
 		if len(cargs) == 0 {
@@ -2978,26 +3102,42 @@ func main() {
 	// ── Database ─────────────────────────────────────────────────────
 
 	case "update":
-		path := ""
-		if len(cargs) > 0 {
-			path = strings.Trim(strings.Join(cargs, " "), "\"'")
+		if len(cargs) == 0 {
+			// Update entire library
+			jobID, err := client.Update("")
+			if err != nil {
+				log.Fatalf("❌ update: %v", err)
+			}
+			fmt.Printf("🔄 DB update started (job %d)\n", jobID)
+		} else {
+			// Update each specified path
+			for _, path := range expandArgs(cargs) {
+				jobID, err := client.Update(path)
+				if err != nil {
+					fmt.Printf("%s❌ update %q: %v%s\n", ColorRed, path, err, Reset)
+				} else {
+					fmt.Printf("🔄 DB update started for %q (job %d)\n", path, jobID)
+				}
+			}
 		}
-		jobID, err := client.Update(path)
-		if err != nil {
-			log.Fatalf("❌ update: %v", err)
-		}
-		fmt.Printf("🔄 DB update started (job %d)\n", jobID)
 
 	case "rescan":
-		path := ""
-		if len(cargs) > 0 {
-			path = strings.Trim(strings.Join(cargs, " "), "\"'")
+		if len(cargs) == 0 {
+			jobID, err := client.Rescan("")
+			if err != nil {
+				log.Fatalf("❌ rescan: %v", err)
+			}
+			fmt.Printf("🔄 Rescan started (job %d)\n", jobID)
+		} else {
+			for _, path := range expandArgs(cargs) {
+				jobID, err := client.Rescan(path)
+				if err != nil {
+					fmt.Printf("%s❌ rescan %q: %v%s\n", ColorRed, path, err, Reset)
+				} else {
+					fmt.Printf("🔄 Rescan started for %q (job %d)\n", path, jobID)
+				}
+			}
 		}
-		jobID, err := client.Rescan(path)
-		if err != nil {
-			log.Fatalf("❌ rescan: %v", err)
-		}
-		fmt.Printf("🔄 Rescan started (job %d)\n", jobID)
 
 	// ── MPD config ──────────────────────────────────────────────────
 

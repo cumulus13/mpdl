@@ -1,6 +1,6 @@
 module github.com/cumulus13/mpdl
 
-go 1.21
+go 1.25.3
 
 require (
 	github.com/BurntSushi/toml v1.6.0
