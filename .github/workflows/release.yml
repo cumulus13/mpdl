@@ -1,4 +1,4 @@
-name: Build and Release
+name: Build and Release (Manual / Tag Trigger)
 
 on:
   push:
@@ -11,8 +11,8 @@ permissions:
 
 jobs:
   build:
-    name: Build ${{ matrix.os }} ${{ matrix.arch }}
-    runs-on: ${{ matrix.runner }}
+    name: Build (${{ matrix.suffix }})
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -20,36 +20,109 @@ jobs:
           # Windows
           - os: windows
             arch: amd64
-            runner: windows-latest
             binary: mpdl.exe
+            suffix: windows-amd64
           - os: windows
             arch: arm64
-            runner: windows-latest
             binary: mpdl.exe
+            suffix: windows-arm64
+          - os: windows
+            arch: "386"
+            binary: mpdl.exe
+            suffix: windows-386
 
-          # Linux
+          # Linux x86 / x64
           - os: linux
             arch: amd64
-            runner: ubuntu-latest
             binary: mpdl
+            suffix: linux-amd64
+          - os: linux
+            arch: "386"
+            binary: mpdl
+            suffix: linux-386
+
+          # Linux ARM
           - os: linux
             arch: arm64
-            runner: ubuntu-latest
             binary: mpdl
+            suffix: linux-arm64
           - os: linux
             arch: arm
-            runner: ubuntu-latest
+            goarm: "7"
             binary: mpdl
+            suffix: linux-armv7
+          - os: linux
+            arch: arm
+            goarm: "6"
+            binary: mpdl
+            suffix: linux-armv6
+
+          # Android CLI
+          - os: linux
+            arch: arm
+            goarm: "7"
+            binary: mpdl
+            suffix: android-armv7
+          - os: linux
+            arch: arm64
+            binary: mpdl
+            suffix: android-arm64
+
+          # MIPS
+          - os: linux
+            arch: mips
+            binary: mpdl
+            suffix: linux-mips
+          - os: linux
+            arch: mipsle
+            binary: mpdl
+            suffix: linux-mipsle
+          - os: linux
+            arch: mips64
+            binary: mpdl
+            suffix: linux-mips64
+          - os: linux
+            arch: mips64le
+            binary: mpdl
+            suffix: linux-mips64le
+
+          # Linux Other
+          - os: linux
+            arch: ppc64le
+            binary: mpdl
+            suffix: linux-ppc64le
+          - os: linux
+            arch: riscv64
+            binary: mpdl
+            suffix: linux-riscv64
+          - os: linux
+            arch: s390x
+            binary: mpdl
+            suffix: linux-s390x
 
           # macOS
           - os: darwin
             arch: amd64
-            runner: macos-latest
             binary: mpdl
+            suffix: darwin-amd64
           - os: darwin
             arch: arm64
-            runner: macos-latest
             binary: mpdl
+            suffix: darwin-arm64
+
+          # BSD Family
+          - os: freebsd
+            arch: amd64
+            binary: mpdl
+            suffix: freebsd-amd64
+          - os: netbsd
+            arch: amd64
+            binary: mpdl
+            suffix: netbsd-amd64
+          - os: openbsd
+            arch: amd64
+            binary: mpdl
+            suffix: openbsd-amd64
 
     steps:
       - name: Checkout code
@@ -70,15 +143,23 @@ jobs:
         env:
           GOOS: ${{ matrix.os }}
           GOARCH: ${{ matrix.arch }}
+          GOARM: ${{ matrix.goarm }}
           CGO_ENABLED: 0
         run: |
           go build -v -trimpath -ldflags="-s -w -X main.Version=${{ github.ref_name }}" -o ${{ matrix.binary }} .
+
+      - name: Report binary size
+        run: |
+          echo "=== Binary Details ==="
+          ls -lh ${{ matrix.binary }}
+          echo "=== Exact Size in Bytes ==="
+          stat -c "%s bytes - %n" ${{ matrix.binary }} 2>/dev/null || stat -f "%z bytes - %N" ${{ matrix.binary }}
 
       - name: Create archive (Windows)
         if: matrix.os == 'windows'
         shell: pwsh
         run: |
-          $archiveName = "mpdl-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}.zip"
+          $archiveName = "mpdl-${{ github.ref_name }}-${{ matrix.suffix }}.zip"
           Compress-Archive -Path ${{ matrix.binary }},README.md,LICENSE -DestinationPath $archiveName
           echo "ARCHIVE_NAME=$archiveName" >> $env:GITHUB_ENV
           echo "ARCHIVE_PATH=$archiveName" >> $env:GITHUB_ENV
@@ -86,15 +167,15 @@ jobs:
       - name: Create archive (Unix)
         if: matrix.os != 'windows'
         run: |
-          ARCHIVE_NAME="mpdl-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz"
-          tar -czf $ARCHIVE_NAME ${{ matrix.binary }} README.md LICENSE
+          ARCHIVE_NAME="mpdl-${{ github.ref_name }}-${{ matrix.suffix }}.tar.gz"
+          tar -czf $ARCHIVE_NAME ${{ matrix.binary }} README.md LICENSE 2>/dev/null || tar -czf $ARCHIVE_NAME ${{ matrix.binary }}
           echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> $GITHUB_ENV
           echo "ARCHIVE_PATH=$ARCHIVE_NAME" >> $GITHUB_ENV
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mpdl-${{ matrix.os }}-${{ matrix.arch }}
+          name: mpdl-${{ matrix.suffix }}
           path: ${{ env.ARCHIVE_PATH }}
           retention-days: 1
 
@@ -102,6 +183,10 @@ jobs:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
+    if: |
+      always() &&
+      startsWith(github.ref, 'refs/tags/v') &&
+      !cancelled()
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -111,17 +196,33 @@ jobs:
         with:
           path: ./artifacts
 
+      - name: Check for built artifacts
+        run: |
+          mkdir -p ./artifacts
+          COUNT=$(find ./artifacts -type f ! -name "checksums.txt" | wc -l)
+          echo "Found $COUNT artifacts"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::No artifacts were successfully built."
+            exit 1
+          fi
+
       - name: Create checksums
         run: |
           cd artifacts
           for dir in */; do
-            cd "$dir"
-            for file in *; do
-              sha256sum "$file" >> ../../checksums.txt
-            done
-            cd ..
+            if [ -d "$dir" ]; then
+              cd "$dir"
+              for file in *; do
+                if [ -f "$file" ]; then
+                  sha256sum "$file" >> ../../checksums.txt
+                fi
+              done
+              cd ..
+            fi
           done
           cd ..
+          echo "=== Checksums ==="
+          cat checksums.txt
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -152,17 +253,6 @@ jobs:
             ```bash
             sha256sum -c checksums.txt
             ```
-
-            ### Platforms
-            | Platform | File |
-            |---|---|
-            | Windows x64 | `mpdl-*-windows-amd64.zip` |
-            | Windows ARM64 | `mpdl-*-windows-arm64.zip` |
-            | Linux x64 | `mpdl-*-linux-amd64.tar.gz` |
-            | Linux ARM64 | `mpdl-*-linux-arm64.tar.gz` |
-            | Linux ARM | `mpdl-*-linux-arm.tar.gz` |
-            | macOS Intel | `mpdl-*-darwin-amd64.tar.gz` |
-            | macOS Apple Silicon | `mpdl-*-darwin-arm64.tar.gz` |
 
             See [CHANGELOG.md](CHANGELOG.md) for what changed.
         env:

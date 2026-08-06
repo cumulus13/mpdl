@@ -45,61 +45,97 @@ jobs:
         run: go build -v .
 
   build:
-    name: Build ${{ matrix.output }}
+    name: Build (${{ matrix.output }})
     needs: test
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux
-          - os: ubuntu-latest
-            goos: linux
+          # Linux x86 / x64
+          - goos: linux
             goarch: amd64
             output: mpdl-linux-amd64
-          - os: ubuntu-latest
-            goos: linux
-            goarch: arm64
-            output: mpdl-linux-arm64
-          - os: ubuntu-latest
-            goos: linux
-            goarch: arm
-            goarm: '7'
-            output: mpdl-linux-armv7
-          - os: ubuntu-latest
-            goos: linux
+          - goos: linux
             goarch: '386'
             output: mpdl-linux-386
 
+          # Linux ARM / Raspberry Pi
+          - goos: linux
+            goarch: arm
+            goarm: '6'
+            output: mpdl-linux-armv6
+          - goos: linux
+            goarch: arm
+            goarm: '7'
+            output: mpdl-linux-armv7
+          - goos: linux
+            goarch: arm64
+            output: mpdl-linux-arm64
+
+          # Android CLI (runs on Termux / Kali NetHunter)
+          - goos: linux
+            goarch: arm
+            goarm: '7'
+            output: mpdl-android-armv7
+          - goos: linux
+            goarch: arm64
+            output: mpdl-android-arm64
+
+          # Linux MIPS
+          - goos: linux
+            goarch: mips
+            output: mpdl-linux-mips
+          - goos: linux
+            goarch: mipsle
+            output: mpdl-linux-mipsle
+          - goos: linux
+            goarch: mips64
+            output: mpdl-linux-mips64
+          - goos: linux
+            goarch: mips64le
+            output: mpdl-linux-mips64le
+
+          # Linux Other Architectures
+          - goos: linux
+            goarch: ppc64le
+            output: mpdl-linux-ppc64le
+          - goos: linux
+            goarch: riscv64
+            output: mpdl-linux-riscv64
+          - goos: linux
+            goarch: s390x
+            output: mpdl-linux-s390x
+
           # Windows
-          - os: windows-latest
-            goos: windows
+          - goos: windows
             goarch: amd64
             output: mpdl-windows-amd64.exe
-          - os: windows-latest
-            goos: windows
+          - goos: windows
             goarch: arm64
             output: mpdl-windows-arm64.exe
-          - os: windows-latest
-            goos: windows
+          - goos: windows
             goarch: '386'
             output: mpdl-windows-386.exe
 
           # macOS
-          - os: macos-latest
-            goos: darwin
+          - goos: darwin
             goarch: amd64
             output: mpdl-darwin-amd64
-          - os: macos-latest
-            goos: darwin
+          - goos: darwin
             goarch: arm64
             output: mpdl-darwin-arm64
 
-          # FreeBSD
-          - os: ubuntu-latest
-            goos: freebsd
+          # BSD Family
+          - goos: freebsd
             goarch: amd64
             output: mpdl-freebsd-amd64
+          - goos: netbsd
+            goarch: amd64
+            output: mpdl-netbsd-amd64
+          - goos: openbsd
+            goarch: amd64
+            output: mpdl-openbsd-amd64
 
     steps:
       - name: Checkout code
@@ -123,10 +159,17 @@ jobs:
         run: |
           go build -v -trimpath -ldflags="-s -w -X main.Version=${{ github.ref_name }}" -o ${{ matrix.output }} .
 
+      - name: Report binary size
+        run: |
+          echo "=== Binary Details ==="
+          ls -lh ${{ matrix.output }}
+          echo "=== Exact Size in Bytes ==="
+          stat -c "%s bytes - %n" ${{ matrix.output }} 2>/dev/null || stat -f "%z bytes - %N" ${{ matrix.output }}
+
       - name: Create archive (Unix)
         if: matrix.goos != 'windows'
         run: |
-          tar -czf ${{ matrix.output }}.tar.gz ${{ matrix.output }} README.md LICENSE
+          tar -czf ${{ matrix.output }}.tar.gz ${{ matrix.output }} README.md LICENSE 2>/dev/null || tar -czf ${{ matrix.output }}.tar.gz ${{ matrix.output }}
 
       - name: Create archive (Windows)
         if: matrix.goos == 'windows'
@@ -154,7 +197,10 @@ jobs:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: |
+      always() &&
+      startsWith(github.ref, 'refs/tags/v') &&
+      !cancelled()
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -164,17 +210,33 @@ jobs:
         with:
           path: artifacts
 
+      - name: Check for built artifacts
+        run: |
+          mkdir -p artifacts
+          COUNT=$(find artifacts -type f ! -name "checksums.txt" | wc -l)
+          echo "Found $COUNT artifacts"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::No artifacts were successfully built."
+            exit 1
+          fi
+
       - name: Create checksums
         run: |
           cd artifacts
           for dir in */; do
-            cd "$dir"
-            for file in *; do
-              sha256sum "$file" >> ../../checksums.txt
-            done
-            cd ..
+            if [ -d "$dir" ]; then
+              cd "$dir"
+              for file in *; do
+                if [ -f "$file" ]; then
+                  sha256sum "$file" >> ../../checksums.txt
+                fi
+              done
+              cd ..
+            fi
           done
           cd ..
+          echo "=== Checksums ==="
+          cat checksums.txt
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -191,7 +253,7 @@ jobs:
 
             ### Linux / macOS
             ```bash
-            wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/mpdl-linux-amd64.tar.gz
+            wget [https://github.com/$](https://github.com/$){{ github.repository }}/releases/download/${{ github.ref_name }}/mpdl-linux-amd64.tar.gz
             tar -xzf mpdl-linux-amd64.tar.gz
             chmod +x mpdl-linux-amd64
             sudo mv mpdl-linux-amd64 /usr/local/bin/mpdl
@@ -208,7 +270,5 @@ jobs:
             ```
 
             See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md) for details.
-          draft: false
-          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

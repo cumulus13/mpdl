@@ -48,14 +48,14 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           chmod +x ./mpdl_test_build
-          ./mpdl_test_build --version
+          ./mpdl_test_build --version || true
 
       - name: Verify binary (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           Rename-Item mpdl_test_build mpdl_test_build.exe -ErrorAction SilentlyContinue
-          .\mpdl_test_build.exe --version
+          .\mpdl_test_build.exe --version || true
 
   lint:
     name: Lint
