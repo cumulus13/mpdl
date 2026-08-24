@@ -12,6 +12,7 @@ if errorlevel 1 goto :err
 echo [2/3] Building mpdl.exe ...
 go build -o mpdl.exe .
 if errorlevel 1 goto :err
+copy /y mpdl.exe c:\TOOLS\EXE
 
 echo [3/3] Done!
 echo.

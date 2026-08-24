@@ -256,83 +256,16 @@ func (m *MediaKeyMonitor) monitorLinux() {
 // ── Windows: RegisterHotKey WinAPI ───────────────────────────────────────────
 //
 // RegisterHotKey registers a global hotkey that fires even when the terminal
-// is in the background. It requires a Win32 message loop.
-// We use "golang.org/x/sys/windows" for WinAPI access.
-//
-// VK codes for media keys:
-//   VK_MEDIA_PLAY_PAUSE = 0xB3
-//   VK_MEDIA_NEXT_TRACK = 0xB0
-//   VK_MEDIA_PREV_TRACK = 0xB1
-//   VK_MEDIA_STOP       = 0xB2
-//   VK_VOLUME_UP        = 0xAF
-//   VK_VOLUME_DOWN      = 0xAE
-
+// is in the background, and needs no window and no external tool (no AHK).
+// The actual WinAPI call lives in media_keys_windows.go (build-tagged
+// "windows") since it uses golang.org/x/sys/windows, which only compiles
+// on that GOOS. This file just calls into it.
 func (m *MediaKeyMonitor) monitorWindows() {
-	// Try to register global hotkeys via WinAPI.
-	// We use a subprocess approach (mpdl as its own hotkey daemon) if cgo is off.
-	if err := m.tryWindowsHotkeys(); err != nil {
+	if err := m.monitorWindowsNative(); err != nil {
 		log.Printf("⚠️  Windows global hotkeys failed: %v", err)
 		log.Printf("   Fallback: create an AutoHotkey script — run: mpdl mediakeys")
 		m.keepAlive()
 	}
-}
-
-// tryWindowsHotkeys registers OS-level global media key hooks on Windows.
-// Uses a self-pipe: spawns a lightweight child process that registers the
-// hotkeys and forwards commands back via stdin, so the main mpdl process
-// does not need to run a Win32 message loop itself.
-func (m *MediaKeyMonitor) tryWindowsHotkeys() error {
-	// Check if we have a hotkey helper available (mpdl itself as helper).
-	exe, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("cannot find own executable: %v", err)
-	}
-
-	log.Println("🎹 Windows: registering global media hotkeys via WinAPI helper")
-
-	cmd := exec.Command(exe, "--hotkey-daemon",
-		"--mpd-host", m.client.host,
-		"--mpd-port", m.client.port)
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return err
-	}
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-
-	go func() {
-		select {
-		case <-m.stopChan:
-			_ = cmd.Process.Kill()
-		}
-	}()
-
-	buf := make([]byte, 32)
-	for {
-		n, err := stdout.Read(buf)
-		if err != nil || n == 0 {
-			break
-		}
-		switch strings.TrimSpace(string(buf[:n])) {
-		case "play_pause":
-			m.doPlayPause()
-		case "next":
-			m.doNext()
-		case "prev":
-			m.doPrev()
-		case "stop":
-			m.doStop()
-		case "vol_up":
-			m.doVolUp()
-		case "vol_down":
-			m.doVolDown()
-		}
-	}
-
-	_ = cmd.Wait()
-	return fmt.Errorf("hotkey daemon exited")
 }
 
 // ── macOS: Hammerspoon IPC ────────────────────────────────────────────────────

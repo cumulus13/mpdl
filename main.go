@@ -1159,11 +1159,80 @@ func (m *MPDClient) PlaylistInfo() ([]mpd.Attrs, error) {
 	return m.client.PlaylistInfo(-1, -1)
 }
 
+// IsPathQueued reports whether path (a file or a directory) is already
+// present in the current queue — either as an exact file match, or as a
+// directory whose contents already appear (in whole or in part) in the
+// queue. Path comparison is case-insensitive on Windows/macOS, and
+// case-sensitive on Linux to match filesystem semantics.
+func (m *MPDClient) IsPathQueued(path string) (bool, error) {
+	if err := m.ensureConnected(); err != nil {
+		return false, err
+	}
+	norm := m.normalizePath(path)
+	if norm == "" {
+		return false, nil
+	}
+	entries, err := m.client.PlaylistInfo(-1, -1)
+	if err != nil {
+		return false, err
+	}
+	fold := func(s string) string { return s }
+	if runtime.GOOS != "linux" {
+		fold = strings.ToLower
+	}
+	normF := fold(norm)
+	prefix := normF + "/"
+	for _, song := range entries {
+		f := fold(song["file"])
+		if f == normF || strings.HasPrefix(f, prefix) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// IsAnyPathQueued checks a batch of paths against a single PlaylistInfo
+// snapshot, avoiding one MPD round trip per path. Returns the subset of
+// paths already queued.
+func (m *MPDClient) IsAnyPathQueued(paths []string) (map[string]bool, error) {
+	result := make(map[string]bool, len(paths))
+	if err := m.ensureConnected(); err != nil {
+		return result, err
+	}
+	entries, err := m.client.PlaylistInfo(-1, -1)
+	if err != nil {
+		return result, err
+	}
+	fold := func(s string) string { return s }
+	if runtime.GOOS != "linux" {
+		fold = strings.ToLower
+	}
+	queuedFiles := make([]string, 0, len(entries))
+	for _, song := range entries {
+		queuedFiles = append(queuedFiles, fold(song["file"]))
+	}
+	for _, path := range paths {
+		norm := fold(m.normalizePath(path))
+		if norm == "" {
+			continue
+		}
+		prefix := norm + "/"
+		for _, f := range queuedFiles {
+			if f == norm || strings.HasPrefix(f, prefix) {
+				result[path] = true
+				break
+			}
+		}
+	}
+	return result, nil
+}
+
 // FindInQueue searches the current queue for tracks matching pattern.
 // Pattern formats:
-//   /regex/   — compiled regex matched against Title, Artist, Album, file
-//   *glob*    — filepath.Match glob matched against same fields
-//   text      — case-insensitive substring match
+//
+//	/regex/   — compiled regex matched against Title, Artist, Album, file
+//	*glob*    — filepath.Match glob matched against same fields
+//	text      — case-insensitive substring match
 //
 // Returns matched songs with their "Pos" field set (0-based queue position).
 func (m *MPDClient) FindInQueue(pattern string) ([]mpd.Attrs, error) {
@@ -1388,6 +1457,63 @@ func getTerminalWidth() int {
 
 func printSeparator() {
 	fmt.Println(strings.Repeat("─", getTerminalWidth()))
+}
+
+// wrapPath wraps a (typically slash-separated) string to fit within width,
+// preferring to break after "/" so continuation lines align on path
+// boundaries (e.g. "albums/Artist - Album/" then "01 - Title.mp3"). Any
+// single segment longer than the available width is hard-cut. Continuation
+// lines are indented to line up under prefix, which is written before the
+// first line but NOT counted as part of the wrapped text itself — pass
+// plain text (no ANSI color codes) so width math isn't thrown off, and
+// wrap any color codes around the *result* of this call instead.
+func wrapPath(path, prefix string, width int) string {
+	if width <= 0 {
+		width = 80
+	}
+	indentW := len([]rune(prefix))
+	avail := width - indentW
+	if avail < 10 {
+		avail = 10
+	}
+	indent := strings.Repeat(" ", indentW)
+
+	parts := strings.Split(path, "/")
+	for i := 0; i < len(parts)-1; i++ {
+		parts[i] += "/"
+	}
+
+	var lines []string
+	cur := ""
+	for _, part := range parts {
+		if cur != "" && len([]rune(cur))+len([]rune(part)) > avail {
+			lines = append(lines, cur)
+			cur = ""
+		}
+		for len([]rune(part)) > avail { // segment alone too long — hard cut
+			r := []rune(part)
+			lines = append(lines, string(r[:avail]))
+			part = string(r[avail:])
+		}
+		cur += part
+	}
+	if cur != "" {
+		lines = append(lines, cur)
+	}
+	if len(lines) == 0 {
+		lines = []string{""}
+	}
+
+	var sb strings.Builder
+	sb.WriteString(prefix)
+	for i, l := range lines {
+		if i > 0 {
+			sb.WriteByte('\n')
+			sb.WriteString(indent)
+		}
+		sb.WriteString(l)
+	}
+	return sb.String()
 }
 
 func formatDuration(secs string) string {
@@ -1676,7 +1802,7 @@ func formatConsoleMessage(song mpd.Attrs, status mpd.Attrs, showProgress bool) s
 		sb.WriteString(fmt.Sprintf("%s  💿 %s%s\n", ColorOrange, album, Reset))
 	}
 	sb.WriteString(fmt.Sprintf("%s  🎵 %s%s\n", ColorBlue, bitrate, Reset))
-	sb.WriteString(fmt.Sprintf("%s  📁 %s%s", ColorGreen, file, Reset))
+	sb.WriteString(ColorGreen + wrapPath(file, "  📁 ", getTerminalWidth()) + Reset)
 	return sb.String()
 }
 
@@ -1790,10 +1916,10 @@ func sendNotification(state *AppState, event, title, message string, icon *gntp.
 // It runs in the foreground and owns the terminal.
 //
 // Design:
-//   • A 1-second ticker redraws the progress bar in-place (ANSI cursor up).
-//   • An MPD Watcher fires on song/mixer events (song change, state change).
-//   • A goroutine reads raw stdin bytes for keyboard control.
-//   • q / ESC / Ctrl-C all quit cleanly — NOT global, only active while
+//   - A 1-second ticker redraws the progress bar in-place (ANSI cursor up).
+//   - An MPD Watcher fires on song/mixer events (song change, state change).
+//   - A goroutine reads raw stdin bytes for keyboard control.
+//   - q / ESC / Ctrl-C all quit cleanly — NOT global, only active while
 //     the monitor command is in the foreground.
 func runMonitor(state *AppState) error {
 	// ── startup banner ───────────────────────────────────────────────────────
@@ -1836,9 +1962,9 @@ func runMonitor(state *AppState) error {
 	defer restoreTerminal()
 
 	// ── channels ─────────────────────────────────────────────────────────────
-	quitCh := make(chan struct{})   // keyboard or signal requests quit
-	keyCh  := make(chan byte, 8)   // raw key bytes from stdin reader
-	errCh  := make(chan error, 1)  // fatal errors from watcher goroutine
+	quitCh := make(chan struct{}) // keyboard or signal requests quit
+	keyCh := make(chan byte, 8)   // raw key bytes from stdin reader
+	errCh := make(chan error, 1)  // fatal errors from watcher goroutine
 
 	// ── keyboard goroutine ───────────────────────────────────────────────────
 	if oldState != nil {
@@ -2142,7 +2268,7 @@ func runMonitor(state *AppState) error {
 
 		case key := <-keyCh:
 			switch key {
-			case 'q', 'Q', 27 /* ESC */, 3 /* Ctrl-C */:
+			case 'q', 'Q', 27 /* ESC */, 3 /* Ctrl-C */ :
 				close(quitCh)
 
 			case 'p', 'P', ' ':
@@ -2185,7 +2311,6 @@ func isConnectionErr(err error) bool {
 		strings.Contains(s, "connection") ||
 		strings.Contains(s, "broken pipe")
 }
-
 
 // ──────────────────────────────────────────────
 // Config file discovery
@@ -2459,8 +2584,6 @@ func readStdinPaths() []string {
 	return paths
 }
 
-
-
 func main() {
 	var (
 		configFile    string
@@ -2723,13 +2846,32 @@ func main() {
 
 	case "add":
 		if len(cargs) == 0 {
-			log.Fatal("❌ Usage: mpdl add <path|glob|-> [path2 path3 ...]")
+			log.Fatal("❌ Usage: mpdl add [-f|--force] <path|glob|-> [path2 path3 ...]")
 		}
-		paths := expandArgs(cargs)
+		force := false
+		var rawArgs []string
+		for _, a := range cargs {
+			if a == "-f" || a == "--force" {
+				force = true
+				continue
+			}
+			rawArgs = append(rawArgs, a)
+		}
+		paths := expandArgs(rawArgs)
 		if len(paths) == 0 {
 			log.Fatal("❌ No paths to add")
 		}
+		alreadyQueued := map[string]bool{}
+		if !force {
+			if dup, err := client.IsAnyPathQueued(paths); err == nil {
+				alreadyQueued = dup
+			}
+		}
 		for _, path := range paths {
+			if alreadyQueued[path] {
+				messages = append(messages, fmt.Sprintf("%s⚠ Already in queue, skipped: %s%s", ColorYellow, path, Reset))
+				continue
+			}
 			if err := client.Add(path); err != nil {
 				messages = append(messages, fmt.Sprintf("%s❌ Add failed [%s]: %v%s", ColorRed, path, err, Reset))
 			} else {
