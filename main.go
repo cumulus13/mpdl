@@ -1459,6 +1459,38 @@ func printSeparator() {
 	fmt.Println(strings.Repeat("─", getTerminalWidth()))
 }
 
+// ansiRE matches SGR escape sequences (colors, bold, reset, etc.) so their
+// bytes can be excluded from visible-width measurements.
+var ansiRE = regexp.MustCompile("\x1b\\[[0-9;]*m")
+
+// visibleWidth returns the printable rune width of s, ignoring ANSI SGR
+// escape codes.
+func visibleWidth(s string) int {
+	return len([]rune(ansiRE.ReplaceAllString(s, "")))
+}
+
+// countRenderedLines returns how many physical terminal rows block will
+// actually occupy once printed at the given terminal width — i.e. it
+// accounts for the terminal's own auto-wrap of any line whose visible
+// width exceeds width, not just the '\n'-delimited logical line count.
+// This must match reality exactly, since callers use it to compute how
+// many lines to move the cursor up and erase on the next redraw.
+func countRenderedLines(block string, width int) int {
+	if width <= 0 {
+		width = 80
+	}
+	total := 0
+	for _, line := range strings.Split(strings.TrimSuffix(block, "\n"), "\n") {
+		w := visibleWidth(line)
+		rows := 1
+		if w > width {
+			rows = (w + width - 1) / width // ceil division
+		}
+		total += rows
+	}
+	return total
+}
+
 // wrapPath wraps a (typically slash-separated) string to fit within width,
 // preferring to break after "/" so continuation lines align on path
 // boundaries (e.g. "albums/Artist - Album/" then "01 - Title.mp3"). Any
@@ -2129,11 +2161,9 @@ func runMonitor(state *AppState) error {
 		// ── build new block ───────────────────────────────────────────────
 		tw := getTerminalWidth()
 		var sb strings.Builder
-		lines := 0
 
 		addLine := func(s string) {
 			sb.WriteString(s + "\n")
-			lines++
 		}
 
 		stateStr := status["state"]
@@ -2222,8 +2252,10 @@ func runMonitor(state *AppState) error {
 				ColorGray, Reset, vol+"%",
 				rep, rnd, sng, cns, xf, br, Reset))
 
-			// file path
-			addLine(fmt.Sprintf("  %s%s%s", ColorGray, song["file"], Reset))
+			// file path — wrap at "/" boundaries instead of letting the
+			// terminal hard-cut it mid-name, and instead of a single
+			// logical addLine so the row count below stays accurate.
+			addLine(ColorGray + wrapPath(song["file"], "  ", tw) + Reset)
 		}
 
 		// ── DB update status (shown regardless of play state) ─────────────
@@ -2232,10 +2264,10 @@ func runMonitor(state *AppState) error {
 		}
 
 		sb.WriteString(strings.Repeat("─", tw))
-		lines++
 
-		fmt.Print(sb.String())
-		displayLines = lines
+		block := sb.String()
+		fmt.Print(block)
+		displayLines = countRenderedLines(block, tw)
 	}
 
 	// ── initial draw ──────────────────────────────────────────────────────────
