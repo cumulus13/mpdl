@@ -330,9 +330,9 @@ type queueEntry struct {
 // sorts only the newly-added tracks by Disc→Track tag, then plays the
 // first of those newly-added tracks.
 //
-// It does NOT clear the existing queue — the current playlist is preserved
+// Clear the existing queue is optional — the current playlist is preserved
 // and the new album/folder is appended after it.
-func (m *MPDClient) AddAndPlay(path string) error {
+func (m *MPDClient) AddAndPlay(path string, clear ...bool) error {
 	if err := m.ensureConnected(); err != nil {
 		return err
 	}
@@ -345,6 +345,13 @@ func (m *MPDClient) AddAndPlay(path string) error {
 	}
 	insertOffset := len(before) // first position of the new tracks
 
+	if len(clear) > 0 && clear[0] {
+		if err := m.client.Clear(); err != nil {
+			return fmt.Errorf("Clear playlist ERROR: %v", err)
+		}	
+
+		fmt.Printf("%s✅ Clear playlist ! %s\n", ColorYellow, Reset)
+	}
 	// Step 2 – add the path (may add many files if it is a directory).
 	if err := m.client.Add(m.normalizePath(path)); err != nil {
 		return fmt.Errorf("addplay: add %q: %v", path, err)
@@ -2939,7 +2946,33 @@ func main() {
 		}
 		fmt.Printf("%s▶ Playing from: %s%s\n", ColorGreen, paths[0], Reset)
 
-	case "insert":
+	case "clearaddplay", "clearplay":
+		// Add path(s) to queue, sort by track #, play first of what was added.
+		// Multiple paths: each is added in order; the first track of the
+		// first path is played.
+		if len(cargs) == 0 {
+			log.Fatal("❌ Usage: mpdl addplay <path|glob|-> [path2 ...]")
+		}
+		paths := expandArgs(cargs)
+		if len(paths) == 0 {
+			log.Fatal("❌ No paths to add")
+		}
+		// AddAndPlay the first path (adds + sorts + plays)
+		if err := client.AddAndPlay(paths[0], true); err != nil {
+			log.Fatalf("❌ addplay: %v", err)
+		}
+		// Add any remaining paths to the queue (after the first album)
+		for _, path := range paths[1:] {
+			if err := client.Add(path); err != nil {
+				fmt.Printf("%s⚠ Could not add %q: %v%s\n", ColorYellow, path, err, Reset)
+			} else {
+				fmt.Printf("%s✅ Also queued: %s%s\n", ColorGreen, path, Reset)
+			}
+		}
+		fmt.Printf("%s▶ Playing from: %s%s\n", ColorGreen, paths[0], Reset)
+
+
+	case "insert", "i":
 		if len(cargs) == 0 {
 			log.Fatal("❌ Usage: mpdl insert <path|glob|-> [path2 ...]")
 		}
