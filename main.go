@@ -2705,7 +2705,7 @@ func main() {
 
 	// ── Playback ────────────────────────────────────────────────────
 
-	case "play":
+	case "play", "p", "x":
 		if len(cargs) == 0 {
 			// No args: resume if paused, else start from current/beginning
 			status, err := client.Status()
@@ -2819,7 +2819,7 @@ func main() {
 			}
 		}
 
-	case "pause", "toggle":
+	case "pause", "toggle", "pp", "pa":
 		status, err := client.Status()
 		if err != nil {
 			log.Fatalf("❌ status: %v", err)
@@ -2836,25 +2836,25 @@ func main() {
 			fmt.Printf("%s▶ Playing%s\n", ColorGreen, Reset)
 		}
 
-	case "stop":
+	case "stop", "sp":
 		if err := client.Stop(); err != nil {
 			log.Fatalf("❌ stop: %v", err)
 		}
 		fmt.Printf("%s⏹ Stopped%s\n", ColorRed, Reset)
 
-	case "next", "n":
+	case "next", "n", "ne":
 		if err := client.Next(); err != nil {
 			log.Fatalf("❌ next: %v", err)
 		}
 		fmt.Printf("%s⏭ Next%s\n", ColorCyan, Reset)
 
-	case "prev", "previous", "p":
+	case "prev", "previous", "pr":
 		if err := client.Previous(); err != nil {
 			log.Fatalf("❌ prev: %v", err)
 		}
 		fmt.Printf("%s⏮ Previous%s\n", ColorCyan, Reset)
 
-	case "seek":
+	case "seek", "se", "ff":
 		if len(cargs) == 0 {
 			log.Fatal("❌ Usage: mpdl seek [+/-]SECONDS")
 		}
@@ -2883,7 +2883,7 @@ func main() {
 
 	// ── Playlist mutation ───────────────────────────────────────────
 
-	case "add":
+	case "add", "a", "ad":
 		if len(cargs) == 0 {
 			log.Fatal("❌ Usage: mpdl add [-f|--force] <path|glob|-> [path2 path3 ...]")
 		}
@@ -2946,7 +2946,7 @@ func main() {
 		}
 		fmt.Printf("%s▶ Playing from: %s%s\n", ColorGreen, paths[0], Reset)
 
-	case "clearaddplay", "clearplay":
+	case "clearaddplay", "clearplay", "cp":
 		// Add path(s) to queue, sort by track #, play first of what was added.
 		// Multiple paths: each is added in order; the first track of the
 		// first path is played.
@@ -3040,19 +3040,19 @@ func main() {
 			log.Fatalf("❌ %v", err)
 		}
 
-	case "clear":
+	case "clear", "cls", "c":
 		if err := client.Clear(); err != nil {
 			log.Fatalf("❌ clear: %v", err)
 		}
 		fmt.Println("🗑  Queue cleared")
 
-	case "crop":
+	case "crop", "cr", "crp":
 		if err := client.Crop(); err != nil {
 			log.Fatalf("❌ crop: %v", err)
 		}
 		fmt.Println("✂️  Cropped to current track")
 
-	case "shuffle":
+	case "shuffle", "sf":
 		if err := client.Shuffle(); err != nil {
 			log.Fatalf("❌ shuffle: %v", err)
 		}
@@ -3072,14 +3072,14 @@ func main() {
 		}
 		fmt.Printf("📦 Moved %d → %d\n", from, to)
 
-	case "list", "ls", "playlist":
+	case "list", "ls", "playlist", "pl":
 		if err := renderPlaylist(client, messages); err != nil {
 			log.Fatalf("❌ %v", err)
 		}
 
 	// ── Saved playlists ─────────────────────────────────────────────
 
-	case "save":
+	case "save", "s":
 		if len(cargs) == 0 {
 			log.Fatal("❌ Usage: mpdl save <name>")
 		}
@@ -3089,7 +3089,7 @@ func main() {
 		}
 		fmt.Printf("💾 Saved playlist: %q\n", name)
 
-	case "load":
+	case "load", "l":
 		if len(cargs) == 0 {
 			log.Fatal("❌ Usage: mpdl load <name>")
 		}
@@ -3099,7 +3099,7 @@ func main() {
 		}
 		fmt.Printf("📂 Loaded playlist: %q\n", name)
 
-	case "lsplaylists":
+	case "lsplaylists", "lsp", "lp":
 		pls, err := client.ListPlaylists()
 		if err != nil {
 			log.Fatalf("❌ lsplaylists: %v", err)
@@ -3111,7 +3111,7 @@ func main() {
 			fmt.Printf("  📝 %s  %s(%s)%s\n", pl["playlist"], ColorGray, pl["Last-Modified"], Reset)
 		}
 
-	case "rm", "rmplaylist":
+	case "rm", "rmplaylist", "rem", "remove":
 		if len(cargs) == 0 {
 			log.Fatal("❌ Usage: mpdl rm <playlist-name>")
 		}
@@ -3123,7 +3123,7 @@ func main() {
 
 	// ── Search ──────────────────────────────────────────────────────
 
-	case "search":
+	case "search", "sr", "src":
 		if len(cargs) < 2 {
 			log.Fatal("❌ Usage: mpdl search <type> <query>")
 		}
@@ -3133,7 +3133,7 @@ func main() {
 		}
 		printSongList(results, "Search")
 
-	case "find":
+	case "find", "f", "fs":
 		if len(cargs) < 2 {
 			log.Fatal("❌ Usage: mpdl find <type> <query>")
 		}
@@ -3143,7 +3143,7 @@ func main() {
 		}
 		printSongList(results, "Find")
 
-	case "findadd":
+	case "findadd", "fa", "fsa":
 		if len(cargs) < 2 {
 			log.Fatal("❌ Usage: mpdl findadd <type> <query>")
 		}
@@ -3152,7 +3152,7 @@ func main() {
 		}
 		fmt.Println("✅ Results added to queue")
 
-	case "listall":
+	case "listall", "la", "all":
 		path := ""
 		if len(cargs) > 0 {
 			path = strings.Trim(strings.Join(cargs, " "), "\"'")
@@ -3170,7 +3170,7 @@ func main() {
 			log.Fatalf("❌ status: %v", err)
 		}
 
-	case "current":
+	case "current", ".":
 		song, err := client.CurrentSong()
 		if err != nil {
 			log.Fatalf("❌ current: %v", err)
@@ -3181,7 +3181,7 @@ func main() {
 		}
 		fmt.Println(formatConsoleMessage(song, status, config.Display.ShowProgress))
 
-	case "stats":
+	case "stats", "ss":
 		s, err := client.GetStats()
 		if err != nil {
 			log.Fatalf("❌ stats: %v", err)
@@ -3194,7 +3194,7 @@ func main() {
 		fmt.Printf("  Play time:    %s\n", formatDuration(s["playtime"]))
 		fmt.Printf("  DB play time: %s\n", formatDuration(s["db_playtime"]))
 
-	case "version":
+	case "version", "v", "ver":
 		status, err := client.Status()
 		if err != nil {
 			log.Fatalf("❌ version: %v", err)
@@ -3204,7 +3204,7 @@ func main() {
 
 	// ── Volume / modes ──────────────────────────────────────────────
 
-	case "volume", "vol":
+	case "volume", "vol", "vo", "vl":
 		if len(cargs) == 0 {
 			s, err := client.Status()
 			if err != nil {
@@ -3234,19 +3234,19 @@ func main() {
 			}
 		}
 
-	case "repeat":
+	case "repeat", "r", "rp":
 		toggleBool(client.Repeat, cargs, "🔁 Repeat", "repeat", client)
 
-	case "random":
+	case "random", "rd", "ran", "rand":
 		toggleBool(client.Random, cargs, "🔀 Random", "random", client)
 
-	case "single":
+	case "single", "si":
 		toggleBool(client.Single, cargs, "🔂 Single", "single", client)
 
-	case "consume":
+	case "consume", "cs", "con":
 		toggleBool(client.Consume, cargs, "🔥 Consume", "consume", client)
 
-	case "crossfade":
+	case "crossfade", "cf", "fade":
 		if len(cargs) == 0 {
 			s, err := client.Status()
 			if err != nil {
@@ -3266,7 +3266,7 @@ func main() {
 
 	// ── Outputs ─────────────────────────────────────────────────────
 
-	case "outputs":
+	case "outputs", "o":
 		outs, err := client.ListOutputs()
 		if err != nil {
 			log.Fatalf("❌ outputs: %v", err)
@@ -3280,7 +3280,7 @@ func main() {
 			fmt.Printf("  [%s] %-30s  %s\n", o["outputid"], o["outputname"], status)
 		}
 
-	case "enable":
+	case "enable", "e":
 		if len(cargs) == 0 {
 			log.Fatal("❌ Usage: mpdl enable <id>")
 		}
@@ -3293,7 +3293,7 @@ func main() {
 		}
 		fmt.Printf("%s✓ Enabled output %d%s\n", ColorGreen, id, Reset)
 
-	case "disable":
+	case "disable", "d":
 		if len(cargs) == 0 {
 			log.Fatal("❌ Usage: mpdl disable <id>")
 		}
@@ -3308,7 +3308,7 @@ func main() {
 
 	// ── Database ─────────────────────────────────────────────────────
 
-	case "update":
+	case "update", "u":
 		if len(cargs) == 0 {
 			// Update entire library
 			jobID, err := client.Update("")
@@ -3328,7 +3328,7 @@ func main() {
 			}
 		}
 
-	case "rescan":
+	case "rescan", "scan", "rs", "sc":
 		if len(cargs) == 0 {
 			jobID, err := client.Rescan("")
 			if err != nil {
@@ -3348,7 +3348,7 @@ func main() {
 
 	// ── MPD config ──────────────────────────────────────────────────
 
-	case "get-config":
+	case "get-config", "config", "conf", "gf":
 		if len(cargs) == 0 {
 			log.Fatal("❌ Usage: mpdl get-config KEY")
 		}
@@ -3358,7 +3358,7 @@ func main() {
 		}
 		fmt.Printf("%s = %s\n", cargs[0], val)
 
-	case "set-config":
+	case "set-config", "set", "confset", "setconf":
 		if len(cargs) < 2 {
 			log.Fatal("❌ Usage: mpdl set-config KEY VALUE")
 		}
@@ -3409,7 +3409,7 @@ func main() {
 			log.Fatalf("❌ Monitor: %v", monErr)
 		}
 
-	case "mediakeys":
+	case "mediakeys", "mk", "mkey", "mkeys", "mks", "key", "keys":
 		SetupSystemMediaKeys()
 
 	default:
