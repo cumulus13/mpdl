@@ -351,6 +351,9 @@ func (m *MPDClient) AddAndPlay(path string, clear ...bool) error {
 		}	
 
 		fmt.Printf("%s✅ Clear playlist ! %s\n", ColorYellow, Reset)
+
+		// FIX: The queue is now empty, so new tracks will start at index 0
+        insertOffset = 0
 	}
 	// Step 2 – add the path (may add many files if it is a directory).
 	if err := m.client.Add(m.normalizePath(path)); err != nil {
@@ -2951,8 +2954,8 @@ func main() {
 		// Multiple paths: each is added in order; the first track of the
 		// first path is played.
 		if len(cargs) == 0 {
-			log.Fatal("❌ Usage: mpdl addplay <path|glob|-> [path2 ...]")
-		}
+                log.Fatal("❌ Usage: mpdl cp/clearplay/clearaddplay <path|glob|-> [path2 ...]") // Updated
+        }
 		paths := expandArgs(cargs)
 		if len(paths) == 0 {
 			log.Fatal("❌ No paths to add")
